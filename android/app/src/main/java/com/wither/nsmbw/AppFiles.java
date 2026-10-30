@@ -252,6 +252,70 @@ final class AppFiles {
         writeText(config, String.join("\n", lines) + "\n");
     }
 
+    /** The UDP port network-play rooms are hosted on unless Config.toml's [netplay] host_port says otherwise. */
+    static final int DEFAULT_HOST_PORT = 52130;
+
+    /**
+     * Config.toml's [netplay] host_port (1024-65535): the UDP port this phone hosts rooms on, which a
+     * router forwards for Direct Connect players over the internet. The game reads it at boot.
+     */
+    static int hostPort(Context context) {
+        final File config = new File(dataDir(context), "Config.toml");
+        if (!config.isFile()) return DEFAULT_HOST_PORT;
+        try {
+            boolean inNetplay = false;
+            for (String line : java.nio.file.Files.readAllLines(config.toPath(), StandardCharsets.UTF_8)) {
+                final String trimmed = line.trim();
+                if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                    inNetplay = trimmed.equals("[netplay]");
+                } else if (inNetplay && setsKey(trimmed, "host_port")) {
+                    String value = trimmed.substring(trimmed.indexOf('=') + 1);
+                    if (value.indexOf('#') >= 0) value = value.substring(0, value.indexOf('#'));
+                    final int port = Integer.parseInt(value.trim());
+                    return port >= 1024 && port <= 65535 ? port : DEFAULT_HOST_PORT;
+                }
+            }
+        } catch (IOException | NumberFormatException e) {
+            android.util.Log.w("NSMBW", "could not read the host port from Config.toml", e);
+        }
+        return DEFAULT_HOST_PORT;
+    }
+
+    /** Sets [netplay] host_port in Config.toml (writeConfig keeps the table); false when out of range. */
+    static boolean setHostPort(Context context, int port) throws IOException {
+        if (port < 1024 || port > 65535) return false;
+        final File config = new File(dataDir(context), "Config.toml");
+        final java.util.List<String> lines = config.isFile()
+                ? new java.util.ArrayList<>(java.nio.file.Files.readAllLines(config.toPath(), StandardCharsets.UTF_8))
+                : new java.util.ArrayList<>();
+        final String entry = "host_port = " + port;
+        int start = -1, end = lines.size();
+        for (int i = 0; i < lines.size(); ++i) {
+            final String trimmed = lines.get(i).trim();
+            if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                if (start >= 0) {
+                    end = i;
+                    break;
+                }
+                if (trimmed.equals("[netplay]")) start = i;
+            }
+        }
+        if (start < 0) {
+            lines.add("");
+            lines.add("[netplay]");
+            lines.add(entry);
+        } else {
+            int at = -1;
+            for (int i = start + 1; i < end; ++i) {
+                if (setsKey(lines.get(i), "host_port")) at = i;
+            }
+            if (at >= 0) lines.set(at, entry);
+            else lines.add(start + 1, entry);
+        }
+        writeText(config, String.join("\n", lines) + "\n");
+        return true;
+    }
+
     private static String apkStamp(Context context) {
         try {
             final PackageInfo info = context.getPackageManager().getPackageInfo(context.getPackageName(), 0);

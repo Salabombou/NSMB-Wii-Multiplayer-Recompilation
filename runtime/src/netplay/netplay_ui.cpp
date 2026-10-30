@@ -2,6 +2,8 @@
 
 #include "netplay/game_layout.h"
 #include "netplay/game_menus.h"
+#include "netplay/net_socket.h"
+#include "netplay/public_ip.h"
 #include "netplay/world_map_nav.h"
 #include "netplay_lobby.h"
 #include "netplay_session.h"
@@ -16,6 +18,9 @@
 #include "updater.h"
 
 #include <imgui.h>
+#include <SDL3/SDL_clipboard.h>
+#include <SDL3/SDL_keyboard.h>
+#include <SDL3/SDL_stdinc.h>
 
 #include <algorithm>
 #include <array>
@@ -28,11 +33,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
 // Defined in hle/vi.cpp: whether an aurora frame is open for drawing.
 extern std::atomic_bool g_auroraFrameActive;
+
+#if defined(__ANDROID__)
+namespace AndroidBridge {
+bool AskDirectAddress(const std::string& current);  // android_bridge.cpp: GameActivity.askDirectAddress
+}
+#endif
 
 namespace NetplayUi {
 namespace {
@@ -47,7 +59,7 @@ constexpr uint32_t kLeft = 0x0001, kRight = 0x0002, kDown = 0x0004, kUp = 0x0008
 constexpr uint32_t kScreenLeft = kUp, kScreenRight = kDown, kScreenUp = kRight, kScreenDown = kLeft;
 
 // None is Couch, the game's own screens. Every other screen is part of LAN play.
-enum class Screen { None, Lan, ChooseFile, Count, Rooms, Room, Message, Settings };
+enum class Screen { None, Lan, ChooseFile, Count, Rooms, Room, Message, Settings, Direct };
 
 constexpr uint16_t kSceneBoot = 0x000;       // the strap screen ("Hold the Wii Remote sideways")
 constexpr uint16_t kSceneStage = 0x005;      // a course, or the title screen's
@@ -58,6 +70,7 @@ constexpr uint16_t kProfileOpeningTitle = 0x2BB;  // EVENT_OPENING_TITLE: only o
 enum Event : uint32_t {
     kEvLeft = 1, kEvRight = 2, kEvUp = 4, kEvDown = 8, kEvConfirm = 16, kEvBack = 32,
     kEvTab0 = 64,  // a tap on a settings tab: kEvTab0 << tab
+    kEvPlus = 1u << 24, kEvMinus = 1u << 25,  // Direct Connect: + connects, - erases
 };
 
 struct Ui {
@@ -82,6 +95,12 @@ struct Ui {
     bool pauseSettingsShown = false;  // a level's pause window is open: Settings sits in it
     bool menuSettingsShown = false;  // the world map's + menu is open: our Settings button is in it
     bool settingsFromPause = false;
+    // Direct Connect
+    bool joinedDirect = false;   // the room was reached through Direct Connect: leaving goes back there
+    std::string address;         // the address field
+    size_t caret = 0;            // where typing goes in it
+    std::string directNote;      // why the address can't be used, shown for directNoteFrames
+    int directNoteFrames = 0;
 };
 
 Ui g_ui;
@@ -322,6 +341,7 @@ const char* ScreenName(Screen screen) {
     case Screen::Room: return "room";
     case Screen::Message: return "message";
     case Screen::Settings: return "settings";
+    case Screen::Direct: return "direct connect";
     }
     return "?";
 }
@@ -465,6 +485,71 @@ void ButtonPair(const Canvas& c, const std::string& left, const std::string& rig
     Button(c, right, 126, y, 232, cursor == 1, rightEnabled, g_ui.frame);
     AddHit(-126, y, 240, 60, 0);
     AddHit(126, y, 240, 60, 1);
+}
+
+// How wide `text` is drawn at `size`, in layout units.
+float TextWidth(const std::string& text, float size) {
+    Assets& a = GetAssets();
+    if (!GameLayout::FontReady(a.message.get())) {
+        return static_cast<float>(text.size()) * size * 0.55f;
+    }
+    return GameLayout::MeasureText(*a.message, Utf16(text), size);
+}
+
+// Text, made smaller as far as needed to fit in `maxWidth`.
+void FitText(const Canvas& c, const std::string& text, float x, float y, float size, float maxWidth, int originH = 1,
+             uint32_t color = 0xFFFFFFFFu) {
+    const float width = TextWidth(text, size);
+    if (width > maxWidth && width > 0.0f) {
+        size *= maxWidth / width;
+    }
+    Text(c, text, x, y, size, originH, color);
+}
+
+// A plain rounded box w x h centred on (x, y), colour 0xRRGGBBAA.
+void Box(const Canvas& c, float x, float y, float w, float h, uint32_t rgba, float rounding = 8.0f) {
+    const int alpha = static_cast<int>(static_cast<float>(rgba & 0xFF) * c.alpha);
+    c.list->AddRectFilled(
+        ImVec2(c.view.centerX + (x - w / 2) * c.view.scale, c.view.centerY - (y + h / 2) * c.view.scale),
+        ImVec2(c.view.centerX + (x + w / 2) * c.view.scale, c.view.centerY - (y - h / 2) * c.view.scale),
+        IM_COL32((rgba >> 24) & 0xFF, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF, alpha), rounding * c.view.scale);
+}
+
+// `text` in lines no wider than `maxWidth` at `size`, broken at spaces, and inside a word too long for
+// a line of its own (a long host name).
+std::vector<std::string> WrapLines(const std::string& text, float size, float maxWidth) {
+    std::vector<std::string> lines;
+    std::string line;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t end = text.find(' ', pos);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        std::string word = text.substr(pos, end - pos);
+        pos = end + 1;
+        const std::string joined = line.empty() ? word : line + " " + word;
+        if (TextWidth(joined, size) <= maxWidth) {
+            line = joined;
+            continue;
+        }
+        if (!line.empty()) {
+            lines.push_back(line);
+        }
+        while (word.size() > 1 && TextWidth(word, size) > maxWidth) {
+            size_t fits = word.size() - 1;
+            while (fits > 1 && TextWidth(word.substr(0, fits), size) > maxWidth) {
+                --fits;
+            }
+            lines.push_back(word.substr(0, fits));
+            word.erase(0, fits);
+        }
+        line = word;
+    }
+    if (!line.empty()) {
+        lines.push_back(line);
+    }
+    return lines;
 }
 
 std::string PlayerLine(uint8_t slot, const std::string& name, bool you) {
@@ -1774,15 +1859,23 @@ void HandleSettings(bool left, bool right, bool up, bool down, bool confirm, boo
     }
 }
 
+// Cursor: 0 Join, 1 Create Room (the row), 2 Direct Connect (under them).
 void DrawLan(const Canvas& c) {
-    Window(c, 322);
-    Title(c, "LAN", 0, 112, 40);
-    Text(c, "Join a room on another device,", 0, 40);
-    Text(c, "or create one here.", 0, 5);
-    Text(c, "Tailscale works, but is unstable.", 0, -38, 22, 1, 0xFFF0B0FFu);
-    ButtonPair(c, "Join", "Create Room", 322, g_ui.cursor);
-    Text(c, "(1) Back", 240, 130, 22, 2);  // back to Couch; tappable
-    AddHit(195, 130, 140, 44, -1, true);
+    const float height = 400.0f;
+    Window(c, height);
+    Title(c, "LAN", 0, height / 2 - 49, 40);
+    Text(c, "Join a room on another device,", 0, 79);
+    Text(c, "or create one here.", 0, 44);
+    Text(c, "Tailscale works, but is unstable.", 0, 1, 22, 1, 0xFFF0B0FFu);
+    const float row = -height / 2 + 107.0f, below = -height / 2 + 43.0f;
+    Button(c, "Join", -126, row, 232, g_ui.cursor == 0, true, g_ui.frame);
+    Button(c, "Create Room", 126, row, 232, g_ui.cursor == 1, true, g_ui.frame);
+    Button(c, "Direct Connect", 0, below, 300, g_ui.cursor == 2, true, g_ui.frame);
+    AddHit(-126, row, 240, 60, 0);
+    AddHit(126, row, 240, 60, 1);
+    AddHit(0, below, 308, 60, 2);
+    Text(c, "(1) Back", 240, height / 2 - 31, 22, 2);  // back to Couch; tappable
+    AddHit(195, height / 2 - 31, 140, 44, -1, true);
 }
 
 // A hint over one of the game's own screens, in the empty right half of its title bar.
@@ -1834,10 +1927,353 @@ void DrawRooms(const Canvas& c, const NetplayLobby::Snapshot& lobby) {
     AddHit(175, -height / 2 + 22, 140, 44, -1, true);
 }
 
+// ---------------------------------------------------------------- Direct Connect
+// The host's address typed into a field: with the keyboard on a PC (TypeAddress), the phone's own
+// text box on Android (a tap on the field), or the on-screen keyboard below it, which the remote, a
+// controller, taps and clicks all work. Cursor: 0-39 the keys (four rows of ten), then Paste,
+// Connect and Back along the bottom, and the field.
+constexpr int kOskColumns = 10, kOskRowCount = 4;
+constexpr const char* kOskRows[kOskRowCount] = {"1234567890", "qwertyuiop", "asdfghjkl:", "zxcvbnm.-\b"};
+constexpr int kDirectPaste = 40, kDirectConnect = 41, kDirectBack = 42, kDirectField = 43;
+constexpr size_t kAddressMax = 260;  // a 253-character name and ":65535", with room for a pasted "udp://"
+constexpr float kDirectHeight = 450.0f, kDirectWidth = 640.0f;
+constexpr float kFieldY = 108.0f, kFieldW = 560.0f, kFieldH = 48.0f;
+constexpr float kOskTopY = 50.0f, kOskPitchX = 54.0f, kOskPitchY = 48.0f, kOskKeyW = 48.0f, kOskKeyH = 42.0f;
+constexpr float kDirectButtonsY = -150.0f;
+constexpr float kDirectButtonX[3] = {-200.0f, 0.0f, 200.0f};
+constexpr float kDirectButtonW[3] = {160.0f, 200.0f, 160.0f};
+
+// What can be part of an address: a name's letters, digits, '-' and '_', and '.', ':' and the '/'
+// of a pasted link (netplay/net_socket.h SplitHostPort takes those apart).
+bool AddressChar(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == ':' ||
+           c == '-' || c == '_' || c == '/';
+}
+
+void InsertAddress(const std::string& text) {
+    g_ui.caret = std::min(g_ui.caret, g_ui.address.size());
+    for (const char c : text) {
+        if (!AddressChar(c) || g_ui.address.size() >= kAddressMax) {
+            continue;
+        }
+        g_ui.address.insert(g_ui.address.begin() + static_cast<std::ptrdiff_t>(g_ui.caret), c);
+        ++g_ui.caret;
+    }
+}
+
+void EraseAddress() {
+    g_ui.caret = std::min(g_ui.caret, g_ui.address.size());
+    if (g_ui.caret > 0) {
+        g_ui.address.erase(g_ui.caret - 1, 1);
+        --g_ui.caret;
+    }
+}
+
+void PasteAddress() {
+    if (char* text = SDL_GetClipboardText()) {
+        InsertAddress(text);
+        SDL_free(text);
+    }
+}
+
+// From the LAN screen (or back from a failed attempt): the field keeps what was typed, else offers
+// the address that worked last time.
+void OpenDirect() {
+    if (g_ui.address.empty()) {
+        g_ui.address = NetplayLobby::LastDirectAddress();
+    }
+    g_ui.caret = g_ui.address.size();
+    g_ui.directNoteFrames = 0;
+#if defined(__ANDROID__)
+    Show(Screen::Direct, kDirectField);  // confirm opens the phone's text box
+#else
+    Show(Screen::Direct, g_ui.address.empty() ? 0 : kDirectConnect);
+#endif
+}
+
+void ConnectDirect() {
+    std::string host, error;
+    uint16_t port = 0;
+    if (!Netplay::SplitHostPort(g_ui.address, Netplay::kDefaultPort, host, port, &error)) {
+        g_ui.directNote = error;
+        g_ui.directNoteFrames = 300;
+        return;
+    }
+    g_ui.joinedDirect = true;
+    NetplayLobby::Connect(g_ui.address);
+    Show(Screen::Room);
+}
+
+void EditAddressOnPhone() {
+#if defined(__ANDROID__)
+    AndroidBridge::AskDirectAddress(g_ui.address);
+#endif
+}
+
+// The Android text box's answer (SetDirectAddress), taken on the next frame.
+std::mutex g_phoneAddressMutex;
+bool g_phoneAddressReady = false;
+bool g_phoneAddressConnect = false;
+std::string g_phoneAddress;
+
+void TakePhoneAddress() {
+    std::string text;
+    bool connect = false;
+    {
+        std::lock_guard<std::mutex> lock(g_phoneAddressMutex);
+        if (!g_phoneAddressReady) {
+            return;
+        }
+        g_phoneAddressReady = false;
+        text = g_phoneAddress;
+        connect = g_phoneAddressConnect;
+    }
+    if (g_ui.screen != Screen::Direct) {
+        return;
+    }
+    g_ui.address.clear();
+    g_ui.caret = 0;
+    InsertAddress(text);
+    if (connect) {
+        ConnectDirect();
+    }
+}
+
+// The PC's keyboard: typed characters, Backspace and Delete, the arrows, Home and End, Ctrl+V,
+// Enter to connect and Esc to go back. None while one of the F10 bar's own fields or windows has it.
+void TypeAddress() {
+#if !defined(__ANDROID__)
+    const ImGuiIO& io = ImGui::GetIO();
+    if (io.WantTextInput || io.WantCaptureKeyboard) {
+        return;
+    }
+    for (const ImWchar ch : io.InputQueueCharacters) {
+        if (ch < 0x80) {
+            InsertAddress(std::string(1, static_cast<char>(ch)));
+        }
+    }
+    g_ui.caret = std::min(g_ui.caret, g_ui.address.size());
+    if (ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
+        EraseAddress();
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Delete) && g_ui.caret < g_ui.address.size()) {
+        g_ui.address.erase(g_ui.caret, 1);
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow) && g_ui.caret > 0) {
+        --g_ui.caret;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_RightArrow) && g_ui.caret < g_ui.address.size()) {
+        ++g_ui.caret;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) {
+        g_ui.caret = 0;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_End, false)) {
+        g_ui.caret = g_ui.address.size();
+    }
+    if ((io.KeyCtrl || io.KeySuper) && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
+        PasteAddress();
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+        g_ui.events |= kEvPlus;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        g_ui.events |= kEvBack;
+    }
+#endif
+}
+
+// SDL only sends typed text between SDL_StartTextInput and SDL_StopTextInput (ImGui's backend starts
+// it for its own fields alone), and the keyboard's remote must not press buttons meanwhile.
+void KeepTextInput(bool want) {
+#if !defined(__ANDROID__)
+    static SDL_Window* started = nullptr;
+    SDL_Window* window = want ? SDL_GetKeyboardFocus() : nullptr;
+    if (window != nullptr) {
+        if (!SDL_TextInputActive(window)) {
+            SDL_StartTextInput(window);
+        }
+        started = window;
+    } else if (started != nullptr) {
+        if (!ImGui::GetIO().WantTextInput) {
+            SDL_StopTextInput(started);  // unless an F10 field has taken it over meanwhile
+        }
+        started = nullptr;
+    }
+    Keybinds::SetTextEntry(want);
+#else
+    (void)want;
+#endif
+}
+
+void DrawDirect(const Canvas& c) {
+    Window(c, kDirectHeight, kDirectWidth);
+    Title(c, "Direct Connect", 0, kDirectHeight / 2 - 37, 36);
+    if (g_ui.directNoteFrames > 0) {
+        FitText(c, g_ui.directNote, 0, 150, 22, kFieldW, 1, 0xFFE040FFu);
+    } else {
+        FitText(c, "The host's IP address or name, and :port if it isn't 52130.", 0, 150, 22, kFieldW, 1, 0xC8D2E6FFu);
+    }
+
+    // The field: what fits of the address around the caret, which blinks.
+    const float size = 28.0f, left = -kFieldW / 2 + 14.0f, room = kFieldW - 28.0f;
+    Box(c, 0, kFieldY, kFieldW, kFieldH, 0x0A1432E6u);
+    const std::string& text = g_ui.address;
+    const size_t caret = std::min(g_ui.caret, text.size());
+    if (text.empty()) {
+#if defined(__ANDROID__)
+        Text(c, "Tap here to type", left, kFieldY, 24, 0, 0x8C96AAFFu);
+#else
+        Text(c, "Type it, e.g. 203.0.113.5 or example.com:52130", left, kFieldY, 22, 0, 0x8C96AAFFu);
+#endif
+    } else {
+        // The widest run around the caret that fits: the measured width only grows with the run.
+        size_t first = 0, last = caret;
+        for (size_t hi = caret; first < hi;) {
+            const size_t mid = (first + hi) / 2;
+            if (TextWidth(text.substr(mid, caret - mid), size) > room) {
+                first = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        for (size_t hi = text.size(); last < hi;) {
+            const size_t mid = (last + hi + 1) / 2;
+            if (TextWidth(text.substr(first, mid - first), size) <= room) {
+                last = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        Text(c, text.substr(first, last - first), left, kFieldY, size, 0);
+        if ((g_ui.frame / 30) % 2 == 0) {
+            const float x = left + TextWidth(text.substr(first, caret - first), size) + 1.5f;
+            Box(c, x, kFieldY, 2.5f, size * 0.9f, 0xFFFFFFFFu, 0.0f);
+        }
+    }
+    if (g_ui.cursor == kDirectField) {
+        Cursor(c, 0, kFieldY, kFieldW + 6, kFieldH + 6, g_ui.frame);
+    }
+    AddHit(0, kFieldY, kFieldW, kFieldH + 8, kDirectField);
+
+    for (int row = 0; row < kOskRowCount; ++row) {
+        for (int column = 0; column < kOskColumns; ++column) {
+            const int index = row * kOskColumns + column;
+            const char key = kOskRows[row][column];
+            const float x = (column - 4.5f) * kOskPitchX, y = kOskTopY - row * kOskPitchY;
+            const bool selected = g_ui.cursor == index;
+            Box(c, x, y, kOskKeyW, kOskKeyH, selected ? 0x3C78D2F0u : 0x14285AE6u);
+            if (key == '\b') {
+                Text(c, "Del", x, y, 20);
+            } else {
+                Text(c, std::string(1, key), x, y, 28);
+            }
+            if (selected) {
+                Cursor(c, x, y, kOskKeyW + 4, kOskKeyH + 4, g_ui.frame);
+            }
+            AddHit(x, y, kOskPitchX, kOskPitchY, index);
+        }
+    }
+    const char* const labels[3] = {"Paste", "Connect", "Back"};
+    for (int i = 0; i < 3; ++i) {
+        const int index = kDirectPaste + i;
+        Button(c, labels[i], kDirectButtonX[i], kDirectButtonsY, kDirectButtonW[i], g_ui.cursor == index,
+               index != kDirectConnect || !g_ui.address.empty(), g_ui.frame, 28.0f);
+        AddHit(kDirectButtonX[i], kDirectButtonsY, kDirectButtonW[i] + 8, 60, index);
+    }
+    Text(c, "(+) Connect     (-) Erase     (1) Back", 0, -kDirectHeight / 2 + 26, 20, 1, 0xC8D2E6FFu);
+}
+
+void HandleDirect(uint32_t ev) {
+    int& cursor = g_ui.cursor;
+    const bool left = ev & kEvLeft, right = ev & kEvRight, up = ev & kEvUp, down = ev & kEvDown;
+    if (cursor < kDirectPaste) {
+        const int row = cursor / kOskColumns, column = cursor % kOskColumns;
+        if (left) cursor = row * kOskColumns + (column + kOskColumns - 1) % kOskColumns;
+        if (right) cursor = row * kOskColumns + (column + 1) % kOskColumns;
+        if (up) cursor = row == 0 ? kDirectField : cursor - kOskColumns;
+        if (down) cursor = row < kOskRowCount - 1 ? cursor + kOskColumns
+                           : column <= 2         ? kDirectPaste
+                           : column <= 6         ? kDirectConnect
+                                                 : kDirectBack;
+    } else if (cursor <= kDirectBack) {
+        if (left) cursor = cursor == kDirectPaste ? kDirectBack : cursor - 1;
+        if (right) cursor = cursor == kDirectBack ? kDirectPaste : cursor + 1;
+        if (up) cursor = (kOskRowCount - 1) * kOskColumns + (cursor == kDirectPaste ? 1 : cursor == kDirectConnect ? 4 : 8);
+    } else if (down) {
+        cursor = 4;  // the field: down to the keys
+    }
+    if (ev & kEvConfirm) {
+        if (cursor < kDirectPaste) {
+            const char key = kOskRows[cursor / kOskColumns][cursor % kOskColumns];
+            if (key == '\b') {
+                EraseAddress();
+            } else {
+                InsertAddress(std::string(1, key));
+            }
+        } else if (cursor == kDirectPaste) {
+            PasteAddress();
+        } else if (cursor == kDirectConnect) {
+            ev |= kEvPlus;
+        } else if (cursor == kDirectBack) {
+            ev |= kEvBack;
+        } else {
+            EditAddressOnPhone();
+        }
+    }
+    if (ev & kEvMinus) {
+        EraseAddress();
+    }
+    if (ev & kEvBack) {
+        Show(Screen::Lan, 2);  // the cursor back on Direct Connect
+        return;
+    }
+    if (ev & kEvPlus) {
+        ConnectDirect();
+    }
+}
+
+// Direct Connect, before there is a room: the name being looked up or the address being asked.
+void DrawConnecting(const Canvas& c, const NetplayLobby::Snapshot& lobby) {
+    const float height = 300.0f;
+    Window(c, height);
+    Title(c, "Direct Connect", 0, height / 2 - 40, 36);
+    const auto lines = WrapLines(lobby.message.empty() ? "Connecting..." : lobby.message, 26, 470);
+    const int count = static_cast<int>(std::min<size_t>(lines.size(), 3));
+    for (int i = 0; i < count; ++i) {
+        Text(c, lines[i], 0, 20 + (count - 1) * 16.0f - i * 32.0f, 26);
+    }
+    Button(c, "Cancel", 0, -height / 2 + 43.0f, 232, true, true, g_ui.frame);
+    AddHit(0, -height / 2 + 43.0f, 240, 60, 0);
+}
+
+// The host's own addresses, for its room screen: what Direct Connect players type.
+std::string HostLanAddress() {
+    static std::vector<std::string> own;
+    static std::chrono::steady_clock::time_point at{};
+    const auto now = std::chrono::steady_clock::now();
+    if (at == std::chrono::steady_clock::time_point{} || now - at > std::chrono::seconds(2)) {
+        own = NetplayLobby::OwnAddresses();  // Tailscale first
+        at = now;
+    }
+    for (const auto& text : own) {
+        Netplay::Address address;
+        if (Netplay::ParseAddress(text, 1, address) && !Netplay::IsTailscaleIp(address.ip)) {
+            return text;
+        }
+    }
+    return own.empty() ? std::string() : own.front();
+}
+
 void DrawRoom(const Canvas& c, const NetplayLobby::Snapshot& lobby) {
-    const float height = 400;
+    if (lobby.phase == Phase::Connecting) {
+        DrawConnecting(c, lobby);
+        return;
+    }
+    // The host's window also lists its addresses for Direct Connect.
+    const bool host = lobby.localSlot == 0 && lobby.phase != Phase::Joining;
+    const float height = host ? 450.0f : 400.0f;
     Window(c, height, 560);
-    const bool host = lobby.localSlot == 0;
     Title(c, lobby.roomName.empty() ? "Room" : lobby.roomName, 0, height / 2 - 40, 36);
     for (int slot = 0; slot < std::max<int>(lobby.maxPlayers, 2); ++slot) {
         const auto member = std::find_if(lobby.members.begin(), lobby.members.end(),
@@ -1848,6 +2284,22 @@ void DrawRoom(const Canvas& c, const NetplayLobby::Snapshot& lobby) {
         } else {
             Text(c, std::to_string(slot + 1) + "P  waiting...", -230, y, 28, 0, 0xC8D2E6FFu);
         }
+    }
+    if (host && lobby.hostPort != 0) {
+        // Direct Connect: this device's public address (looked up while the room is open) and its
+        // address on the local network, each with the room's port.
+        PublicIp::Request();
+        const PublicIp::Result publicIp = PublicIp::Get();
+        const std::string port = ":" + std::to_string(lobby.hostPort);
+        const std::string internet =
+            publicIp.state == PublicIp::State::Known    ? publicIp.ip + port
+            : publicIp.state == PublicIp::State::Failed ? std::string("address unknown")
+                                                        : std::string("finding your address...");
+        const std::string lan = HostLanAddress();
+        FitText(c, "Internet: " + internet + (lan.empty() ? "" : "    Network: " + lan + port), 0, -42, 21, 520, 1,
+                0xC8D2E6FFu);
+        FitText(c, "For internet play, forward UDP " + std::to_string(lobby.hostPort) + " on your router to this device.",
+                0, -68, 20, 520, 1, 0xC8D2E6FFu);
     }
     std::string status;
     if (lobby.phase == Phase::Starting || lobby.phase == Phase::Restarting) {
@@ -1862,19 +2314,34 @@ void DrawRoom(const Canvas& c, const NetplayLobby::Snapshot& lobby) {
     if (!lobby.message.empty() && lobby.phase == Phase::Hosting) {
         status = lobby.message;
     }
-    Text(c, status, 0, -height / 2 + 100, 24, 1, 0xFFF0B0FFu);
+    FitText(c, status, 0, -height / 2 + 100, 24, 520, 1, 0xFFF0B0FFu);
     if (lobby.phase == Phase::Starting || lobby.phase == Phase::Restarting) {
         return;
     }
     if (host) {
         ButtonPair(c, "Start", "Cancel", height, g_ui.cursor, lobby.members.size() >= 2, true);
     } else {
-        Button(c, "Leave", 0, -height / 2 + 43.0f, 232, true, true, g_ui.frame);
+        Button(c, lobby.phase == Phase::Joining ? "Cancel" : "Leave", 0, -height / 2 + 43.0f, 232, true, true,
+               g_ui.frame);
         AddHit(0, -height / 2 + 43.0f, 240, 60, 0);
     }
 }
 
 void DrawMessage(const Canvas& c) {
+    if (g_ui.message.size() > 60) {
+        // A long one (Direct Connect's say what to check): wrapped, smaller, in a taller window.
+        const float size = 26.0f, pitch = 32.0f;
+        const auto lines = WrapLines(g_ui.message, size, 480.0f);
+        const int count = static_cast<int>(std::min<size_t>(lines.size(), 6));
+        const float height = std::max(300.0f, count * pitch + 200.0f);
+        Window(c, height);
+        for (int i = 0; i < count; ++i) {
+            Text(c, lines[i], 0, 14 + (count - 1) * pitch / 2 - i * pitch, size);
+        }
+        Button(c, "OK", 0, -height / 2 + 43.0f, 232, true, true, g_ui.frame);
+        AddHit(0, -height / 2 + 43.0f, 240, 60, 0);
+        return;
+    }
     Window(c, 300);
     // Up to two lines, split at a space near the middle.
     std::string first = g_ui.message, second;
@@ -1959,7 +2426,9 @@ void HandleEvents(const NetplayLobby::Snapshot& lobby) {
     }
     switch (g_ui.screen) {
     case Screen::Lan:
-        if (left || right) g_ui.cursor ^= 1;
+        if ((left || right) && g_ui.cursor < 2) g_ui.cursor ^= 1;
+        if (down && g_ui.cursor < 2) g_ui.cursor = 2;
+        if (up && g_ui.cursor == 2) g_ui.cursor = 0;
         if (back) {
             // Back to Couch, with the cursor still on the toggle.
             Show(Screen::None);
@@ -1967,16 +2436,22 @@ void HandleEvents(const NetplayLobby::Snapshot& lobby) {
             g_ui.topItem = 0;
         }
         if (confirm) {
+            g_ui.joinedDirect = false;
             if (g_ui.cursor == 0) {
                 NetplayLobby::Browse();
                 Show(Screen::Rooms);
-            } else {
+            } else if (g_ui.cursor == 1) {
                 // The game's own file select picks the save the room plays, then its "Select
                 // Players" the room's size.
                 g_ui.countHintFrames = 0;
                 Show(Screen::ChooseFile);
+            } else {
+                OpenDirect();
             }
         }
+        break;
+    case Screen::Direct:
+        HandleDirect(ev);
         break;
     case Screen::Count:
         if (g_ui.countPicked) {
@@ -2022,14 +2497,22 @@ void HandleEvents(const NetplayLobby::Snapshot& lobby) {
             }
         } else if (back || confirm) {
             NetplayLobby::Stop();
-            NetplayLobby::Browse();
-            Show(Screen::Rooms);
+            if (g_ui.joinedDirect) {
+                OpenDirect();  // the address is still in the field, to try again or change
+            } else {
+                NetplayLobby::Browse();
+                Show(Screen::Rooms);
+            }
         }
         break;
     case Screen::Message:
         if (confirm || back) {
             NetplayLobby::Stop();
-            Show(g_ui.afterMessage);
+            if (g_ui.afterMessage == Screen::Direct) {
+                OpenDirect();
+            } else {
+                Show(g_ui.afterMessage);
+            }
         }
         break;
     case Screen::Settings:
@@ -2264,6 +2747,13 @@ bool TapScreenUp() {
     return g_tapScreen.load(std::memory_order_acquire);
 }
 
+void SetDirectAddress(const std::string& text, bool connect) {
+    std::lock_guard<std::mutex> lock(g_phoneAddressMutex);
+    g_phoneAddress = text;
+    g_phoneAddressConnect = connect;
+    g_phoneAddressReady = true;
+}
+
 bool Playing() {
     return g_playing.load(std::memory_order_acquire);
 }
@@ -2303,13 +2793,15 @@ void OnSessionStall() {
 
 // NSMBW_LOBBY_TEST (Android: debug.nsmbw.lobbytest) drives the lobby without the menus, to test
 // rooms between devices: "host" opens a room for 2 and starts it once someone joins, "join" joins
-// the first room it finds. The session then starts as it does from the menus.
+// the first room it finds, "connect:<address>" joins the room at that address or name (Direct
+// Connect, e.g. connect:mc.okayu.zip:6000). The session then starts as it does from the menus.
 bool LobbyTest() {
     static const std::string mode = [] {
         const char* value = std::getenv("NSMBW_LOBBY_TEST");
         return value != nullptr ? std::string(value) : std::string();
     }();
-    if (mode != "host" && mode != "join") {
+    const bool connect = mode.rfind("connect:", 0) == 0;
+    if (mode != "host" && mode != "join" && !connect) {
         return false;
     }
     static bool begun = false;
@@ -2318,6 +2810,8 @@ bool LobbyTest() {
         RT_LOGF(RT_TAG_RUNTIME, "netplay test: %s\n", mode.c_str());
         if (mode == "host") {
             NetplayLobby::Host(2, 0);
+        } else if (connect) {
+            NetplayLobby::Connect(mode.substr(8));
         } else {
             NetplayLobby::Browse();
         }
@@ -2552,6 +3046,7 @@ void Draw() {
     }
     DumpLayouts();
     ScriptedTaps();
+    KeepTextInput(g_ui.screen == Screen::Direct && !NetplaySession::Active());
     ImDrawList* list = ImGui::GetBackgroundDrawList();
     // A pause menu: looked for every few frames (walking the object tree is not free).
     static int pauseCheck = 0;
@@ -2722,7 +3217,9 @@ void Draw() {
 
     const NetplayLobby::Snapshot lobby = NetplayLobby::Get();
     if (lobby.phase == Phase::Failed && g_ui.screen != Screen::Message) {
-        ShowMessage(lobby.message.empty() ? "Something went wrong." : lobby.message, Screen::Lan);
+        // A Direct Connect that didn't work goes back to its address, to correct it.
+        ShowMessage(lobby.message.empty() ? "Something went wrong." : lobby.message,
+                    g_ui.joinedDirect ? Screen::Direct : Screen::Lan);
     }
     if (lobby.phase == Phase::Restarting && !g_ui.restarting) {
         NetplayLobby::Plan plan;
@@ -2735,9 +3232,16 @@ void Draw() {
             }
         }
     }
+    if (g_ui.screen == Screen::Direct) {
+        TakePhoneAddress();
+        TypeAddress();
+    }
     HandleEvents(lobby);
     if (g_ui.countHintFrames > 0) {
         --g_ui.countHintFrames;
+    }
+    if (g_ui.directNoteFrames > 0) {
+        --g_ui.directNoteFrames;
     }
 
     GetAssets();
@@ -2774,6 +3278,10 @@ void Draw() {
         Veil(c);
         DrawSettings(c);
         break;
+    case Screen::Direct:
+        Veil(c);
+        DrawDirect(c);
+        break;
     case Screen::None:
         break;
     }
@@ -2803,6 +3311,8 @@ void FilterGameInput(uint32_t chan, WiiRemoteInput::KpadSample& sample) {
         if (pressed & (kTwo | kA)) g_ui.events |= kEvConfirm;
         if (pressed & (kOne | kB)) g_ui.events |= kEvBack;
         if ((pressed & kPlus) && g_ui.screen == Screen::Settings) g_ui.events |= kEvBack;  // Esc / + closes it
+        if ((pressed & kPlus) && g_ui.screen == Screen::Direct) g_ui.events |= kEvPlus;    // connects
+        if ((pressed & kMinus) && g_ui.screen == Screen::Direct) g_ui.events |= kEvMinus;  // erases
 
         // The world map's + menu: Settings sits between Quick Save and Title Screen. The game never
         // sees the presses that move onto or off it, and its own cursor is moved to match.

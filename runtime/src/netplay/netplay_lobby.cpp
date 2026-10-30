@@ -39,6 +39,10 @@ constexpr uint8_t kVersion = 1;
 constexpr size_t kChunk = 1024;
 constexpr size_t kMaxChunks = 128;  // 128 KiB of save data at most
 constexpr auto kTimeout = 6s;
+// Direct Connect: how long the typed address may take to answer once looked up, and how long the
+// system's resolver may take before the name counts as not found.
+constexpr auto kDirectTimeout = 8s;
+constexpr auto kLookupTimeout = 20s;
 
 enum Type : uint8_t {
     kDiscover = 1,
@@ -140,6 +144,7 @@ struct State {
     uint64_t roomId = 0;
     uint8_t maxPlayers = 0;
     int saveFile = 0;
+    uint16_t hostPort = 0;
     std::vector<HostMember> members;  // excluding the host
     // Browsing / member
     std::vector<FoundRoom> rooms;
@@ -156,6 +161,12 @@ struct State {
     uint32_t hostTime = 0;             // the host's clock in its last room state, echoed for the RTT
     Clock::time_point hostTimeAt{};
     bool memberReady = false;          // member: the save arrived intact and is kept
+    // Direct Connect
+    bool direct = false;
+    std::string directText;             // host[:port] as it is remembered and shown
+    std::vector<Netplay::Address> directTargets;  // every address the name stands for, once looked up
+    Clock::time_point directResolvedAt{};
+    uint64_t directGeneration = 0;      // a lookup still running for an older Connect is dropped
     // Start (both sides)
     Plan plan;
     bool planReady = false;
@@ -273,8 +284,54 @@ bool RememberHostText(const std::string& text) {
     return true;
 }
 
+// A device played with: asked for rooms from now on. Only addresses of a local network or a tailnet:
+// a public one (a Direct Connect host, or a player who reached this host over the internet) would
+// have rooms announced to it at random later. The port is kept when it isn't the usual one.
 void RememberHost(const Netplay::Address& address) {
-    RememberHostText(Netplay::IpToString(address.ip));
+    if (!Netplay::IsPrivateIp(address.ip)) {
+        return;
+    }
+    RememberHostText(address.port == Netplay::kDefaultPort ? Netplay::IpToString(address.ip) : Netplay::ToString(address));
+}
+
+// Direct Connect's addresses, newest first (Netplay/direct.txt): the newest is offered next time.
+constexpr size_t kMaxDirectAddresses = 8;
+std::mutex g_directMutex;
+
+std::filesystem::path DirectFile() {
+    return RuntimeConfigFile::ApplicationDataDirectory() / "Netplay" / "direct.txt";
+}
+
+std::vector<std::string> ReadDirectLocked() {
+    std::vector<std::string> list;
+    std::ifstream in(DirectFile());
+    std::string line;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
+            line.pop_back();
+        }
+        if (!line.empty() && line[0] != '#') {
+            list.push_back(line);
+        }
+    }
+    return list;
+}
+
+void RememberDirectAddress(const std::string& text) {
+    std::lock_guard<std::mutex> lock(g_directMutex);
+    auto list = ReadDirectLocked();
+    std::erase(list, text);
+    list.insert(list.begin(), text);
+    if (list.size() > kMaxDirectAddresses) {
+        list.resize(kMaxDirectAddresses);
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(DirectFile().parent_path(), ec);
+    std::ofstream out(DirectFile(), std::ios::trunc);
+    out << "# Addresses used with Direct Connect, newest first.\n";
+    for (const auto& entry : list) {
+        out << entry << "\n";
+    }
 }
 
 // The known devices' Tailscale addresses, passed on so that every device on the tailnet that runs
@@ -526,7 +583,9 @@ void HostPacketLocked(State& s, const Netplay::Address& from, uint8_t type, uint
             member = std::prev(s.members.end());
             RT_LOGF(RT_TAG_RUNTIME, "netplay: %s joined the room as player %u (%s)\n", added.name.c_str(), slot + 1,
                     Netplay::ToString(from).c_str());
-            RememberHost(from);  // so this device also finds that one's rooms later
+            // So this device also finds that one's rooms later (on the usual port: `from` is
+            // whatever port the player looked from).
+            RememberHost(Netplay::Address{from.ip, Netplay::kDefaultPort});
         }
         reply.U8(0);
         reply.U8(member->slot);
@@ -667,23 +726,52 @@ void HostTickLocked(State& s) {
 }
 
 // ---------------------------------------------------------------- browser / member
+// A kRoomInfo's room, up to the host's own addresses (the devices it passes on follow); false when
+// it is cut short.
+bool ReadRoomInfo(Reader& r, const Netplay::Address& from, uint64_t roomId, FoundRoom& found) {
+    found.room.id = roomId;
+    found.room.name = r.Str();
+    found.room.host = r.Str();
+    found.room.maxPlayers = r.U8();
+    found.room.players = r.U8();
+    const bool accepting = r.U8() != 0;
+    if (r.bad) {
+        return false;
+    }
+    const uint8_t addressCount = r.U8();
+    for (uint8_t i = 0; i < addressCount && !r.bad; ++i) {
+        found.hostIps.push_back(r.U32());
+    }
+    if (r.bad) {
+        return false;
+    }
+    found.room.full = !accepting || found.room.players >= found.room.maxPlayers;
+    found.room.address = Netplay::ToString(from);
+    found.room.tailscale = Netplay::IsTailscaleIp(from.ip);
+    found.address = from;
+    found.lastSeen = Clock::now();
+    return true;
+}
+
+// Ask the room's host to let this device in (kJoin, resent from MemberTickLocked).
+void BeginJoinLocked(State& s, const FoundRoom& found) {
+    s.hostAddress = found.address;
+    s.joinRoomId = found.room.id;
+    s.joinHostIps = found.hostIps;
+    s.roomName = found.room.name;
+    s.maxPlayers = found.room.maxPlayers;
+    std::random_device random;
+    s.nonce = random();
+    s.phase = Phase::Joining;
+    s.startedAt = Clock::now();
+    s.lastFromHost = Clock::now();
+    s.message.clear();
+}
+
 void MemberPacketLocked(State& s, const Netplay::Address& from, uint8_t type, uint64_t roomId, Reader& r) {
     if (type == kRoomInfo && s.phase == Phase::Browsing) {
         FoundRoom found;
-        found.room.id = roomId;
-        found.room.name = r.Str();
-        found.room.host = r.Str();
-        found.room.maxPlayers = r.U8();
-        found.room.players = r.U8();
-        const bool accepting = r.U8() != 0;
-        if (r.bad) {
-            return;
-        }
-        const uint8_t addressCount = r.U8();
-        for (uint8_t i = 0; i < addressCount && !r.bad; ++i) {
-            found.hostIps.push_back(r.U32());
-        }
-        if (r.bad) {
+        if (!ReadRoomInfo(r, from, roomId, found)) {
             return;
         }
         // The host's own Tailscale address (also when it was found on the Wi-Fi) and the devices
@@ -693,11 +781,6 @@ void MemberPacketLocked(State& s, const Netplay::Address& from, uint8_t type, ui
             LearnLocked(s, ip);
         }
         ReadSharedLocked(s, r);
-        found.room.full = !accepting || found.room.players >= found.room.maxPlayers;
-        found.room.address = Netplay::ToString(from);
-        found.room.tailscale = Netplay::IsTailscaleIp(from.ip);
-        found.address = from;
-        found.lastSeen = Clock::now();
         // One entry per room; prefer the LAN address over a Tailscale one for the same room.
         auto existing = std::find_if(s.rooms.begin(), s.rooms.end(), [&](const FoundRoom& f) { return f.room.id == roomId; });
         if (existing == s.rooms.end()) {
@@ -708,6 +791,46 @@ void MemberPacketLocked(State& s, const Netplay::Address& from, uint8_t type, ui
             existing->lastSeen = found.lastSeen;
         }
         return;
+    }
+    if (type == kRoomInfo && s.phase == Phase::Connecting) {
+        // Only an answer to the typed address's question: from an address it stands for, or from the
+        // asked port on another one (a host with several addresses may answer from another than the
+        // one asked: a PC's VPN or container adapters, a router looping its internet address back).
+        // Nothing it passes on is learned: a host met over the internet is on no network or tailnet
+        // of this device's.
+        const bool asked = std::find(s.directTargets.begin(), s.directTargets.end(), from) != s.directTargets.end();
+        if (!asked && (s.directTargets.empty() || from.port != s.directTargets.front().port)) {
+            return;
+        }
+        FoundRoom found;
+        if (!ReadRoomInfo(r, from, roomId, found)) {
+            return;
+        }
+        if (found.room.full) {
+            s.phase = Phase::Failed;
+            s.message = found.room.players >= found.room.maxPlayers ? "That room is full." : "That room has already started.";
+            return;
+        }
+        found.hostIps.clear();
+        RT_LOGF(RT_TAG_RUNTIME, "netplay: %s answered with '%s' (%u/%u); joining\n", Netplay::ToString(from).c_str(),
+                found.room.name.c_str(), found.room.players, found.room.maxPlayers);
+        BeginJoinLocked(s, found);
+        return;
+    }
+    // The host's answer to this device's join, from another of its addresses than the one asked
+    // (see above): the room's id and the join's own random nonce say it is that host's, and from
+    // now on it is reached there.
+    if (type == kJoinReply && s.phase == Phase::Joining && roomId == s.joinRoomId && from != s.hostAddress) {
+        Reader peek = r;
+        peek.U8();
+        peek.U8();
+        const uint32_t nonce = peek.U32();
+        if (peek.bad || nonce != s.nonce) {
+            return;
+        }
+        RT_LOGF(RT_TAG_RUNTIME, "netplay: the room answered from %s (asked %s)\n", Netplay::ToString(from).c_str(),
+                Netplay::ToString(s.hostAddress).c_str());
+        s.hostAddress = from;
     }
     if (from != s.hostAddress || roomId != s.joinRoomId) {
         return;
@@ -730,6 +853,9 @@ void MemberPacketLocked(State& s, const Netplay::Address& from, uint8_t type, ui
         RememberHost(from);
         for (const uint32_t ip : s.joinHostIps) {
             LearnLocked(s, ip);
+        }
+        if (s.direct) {
+            RememberDirectAddress(s.directText);
         }
         RT_LOGF(RT_TAG_RUNTIME, "netplay: joined the room at %s as player %u\n", Netplay::ToString(from).c_str(), slot + 1);
         return;
@@ -825,6 +951,34 @@ void MemberPacketLocked(State& s, const Netplay::Address& from, uint8_t type, ui
 void MemberTickLocked(State& s) {
     const auto now = Clock::now();
     static Clock::time_point lastSend{};
+    if (s.phase == Phase::Connecting) {
+        if (s.directTargets.empty()) {
+            if (now - s.startedAt > kLookupTimeout) {
+                s.phase = Phase::Failed;
+                s.message = "Couldn't look up " + s.directText + ".";
+            }
+            return;  // still looking the name up (Connect)
+        }
+        static Clock::time_point lastAsk{};
+        if (now - lastAsk > 500ms) {
+            lastAsk = now;
+            // An empty list of devices passed on: this device's tailnet is none of a stranger's business.
+            Writer w;
+            w.U8(0);
+            for (const auto& target : s.directTargets) {
+                Send(s, target, kDiscover, 0, w.data);
+            }
+        }
+        if (now - s.directResolvedAt > kDirectTimeout) {
+            const uint16_t port = s.directTargets.front().port;
+            s.phase = Phase::Failed;
+            s.message = "No room answered at " + s.directText + ". Is the room open, and UDP port " +
+                        std::to_string(port) + " forwarded to the host?";
+            RT_LOGF(RT_TAG_RUNTIME, "netplay: no room answered at %s (%zu address(es) asked)\n", s.directText.c_str(),
+                    s.directTargets.size());
+        }
+        return;
+    }
     if (s.phase == Phase::Browsing) {
         static Clock::time_point lastDiscover{};
         if (now - lastDiscover > 1s) {
@@ -965,6 +1119,10 @@ void StopLocked(State& s, std::unique_lock<std::mutex>& lock) {
     s.blob.clear();
     s.received.clear();
     s.manifest.clear();
+    s.direct = false;
+    s.directText.clear();
+    s.directTargets.clear();
+    ++s.directGeneration;
 }
 
 // The devices to ask (and announce rooms to) one by one: the known ones plus the Tailscale CLI's
@@ -1033,7 +1191,8 @@ bool OpenSocket(State& s, uint16_t port) {
         return true;
     }
     s.phase = Phase::Failed;
-    s.message = port != 0 ? "Another program is using the LAN play port (UDP 52130)." : "Couldn't open a network socket.";
+    s.message = port != 0 ? "Another program is using the LAN play port (UDP " + std::to_string(port) + ")."
+                          : "Couldn't open a network socket.";
     return false;
 }
 
@@ -1048,6 +1207,8 @@ Snapshot Get() {
     snap.roomName = s.roomName;
     snap.maxPlayers = s.maxPlayers;
     snap.localSlot = s.roomId != 0 ? 0 : s.localSlot;
+    snap.hostPort = s.roomId != 0 ? s.hostPort : 0;
+    snap.direct = s.direct;
     snap.members = s.roomId != 0 ? HostMembersLocked(s) : s.roomMembers;
     for (auto it = s.rooms.rbegin(); it != s.rooms.rend(); ++it) {
         snap.rooms.push_back(it->room);
@@ -1065,10 +1226,12 @@ void Host(uint8_t maxPlayers, int saveFile) {
     s.saveFile = saveFile;
     s.roomName = Netplay::DeviceName() + "'s room";
     s.message.clear();
-    if (!OpenSocket(s, Netplay::kDefaultPort)) {
+    const uint16_t port = HostPort();
+    if (!OpenSocket(s, port)) {
         s.roomId = 0;
         return;
     }
+    s.hostPort = port;
     NoteOwnAddresses(s);
     s.unicastTargets.clear();
     s.phase = Phase::Hosting;
@@ -1141,17 +1304,71 @@ void Join(uint64_t roomId) {
     if (it == s.rooms.end() || s.phase != Phase::Browsing) {
         return;
     }
-    s.hostAddress = it->address;
-    s.joinRoomId = roomId;
-    s.joinHostIps = it->hostIps;
-    s.roomName = it->room.name;
-    s.maxPlayers = it->room.maxPlayers;
-    std::random_device random;
-    s.nonce = random();
-    s.phase = Phase::Joining;
-    s.startedAt = Clock::now();
-    s.lastFromHost = Clock::now();
+    BeginJoinLocked(s, *it);
+}
+
+void Connect(const std::string& address) {
+    State& s = S();
+    std::unique_lock<std::mutex> lock(s.mutex);
+    StopLocked(s, lock);
     s.message.clear();
+    std::string host, error;
+    uint16_t port = 0;
+    if (!Netplay::SplitHostPort(address, Netplay::kDefaultPort, host, port, &error)) {
+        s.phase = Phase::Failed;
+        s.message = error;
+        return;
+    }
+    // Any port, on every platform: the host answers wherever the question came from.
+    if (!OpenSocket(s, 0)) {
+        return;
+    }
+    NoteOwnAddresses(s);
+    s.direct = true;
+    s.directText = port == Netplay::kDefaultPort ? host : host + ":" + std::to_string(port);
+    s.directTargets.clear();
+    s.phase = Phase::Connecting;
+    Netplay::Address numeric;
+    s.message = Netplay::ParseAddress(host, port, numeric) ? "Asking " + s.directText + " for its room..."
+                                                           : "Looking up " + host + "...";
+    s.startedAt = Clock::now();
+    const uint64_t generation = ++s.directGeneration;
+    s.thread = std::thread(Thread);
+    RT_LOGF(RT_TAG_RUNTIME, "netplay: direct connect to %s\n", s.directText.c_str());
+    lock.unlock();
+    // The system's resolver blocks, for seconds when DNS is slow: never on the game's thread.
+    std::thread([generation, host, port] {
+        std::vector<Netplay::Address> found = Netplay::ResolveAll(host, port);
+        State& st = S();
+        std::lock_guard<std::mutex> guard(st.mutex);
+        if (st.directGeneration != generation || st.phase != Phase::Connecting) {
+            return;  // given up on, or another Connect since
+        }
+        if (found.empty()) {
+            st.phase = Phase::Failed;
+            st.message = "Couldn't find " + host + ". Check the name, or type the host's IP address.";
+            RT_LOGF(RT_TAG_RUNTIME, "netplay: %s has no IPv4 address\n", host.c_str());
+            return;
+        }
+        std::string list;
+        for (const auto& address : found) {
+            list += (list.empty() ? "" : ", ") + Netplay::ToString(address);
+        }
+        RT_LOGF(RT_TAG_RUNTIME, "netplay: %s is %s; asking for its room\n", host.c_str(), list.c_str());
+        st.directTargets = std::move(found);
+        st.directResolvedAt = Clock::now();
+        st.message = "Asking " + st.directText + " for its room...";
+    }).detach();
+}
+
+uint16_t HostPort() {
+    return RuntimeConfigFile::NetplayHostPort(Netplay::kDefaultPort);
+}
+
+std::string LastDirectAddress() {
+    std::lock_guard<std::mutex> lock(g_directMutex);
+    const auto list = ReadDirectLocked();
+    return list.empty() ? std::string() : list.front();
 }
 
 void Start() {
@@ -1180,6 +1397,7 @@ void Start() {
     }
     plan.players = static_cast<uint8_t>(1 + s.members.size());
     plan.localSlot = 0;
+    plan.port = s.hostPort;
     // Enough frames of input delay to cover half a round trip (clients' input goes through the host).
     plan.inputDelay = std::clamp<uint32_t>((worstRtt / 2 + 12 + 16) / 17, 2, 8);
     plan.saveFile = s.saveFile;

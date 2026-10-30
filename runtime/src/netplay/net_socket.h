@@ -6,11 +6,13 @@
 #include <string_view>
 #include <vector>
 
-// A small UDP layer for network play, on Winsock and BSD sockets alike. IPv4 only: LAN and
-// Tailscale's 100.64.0.0/10 addresses are all the game needs.
+// A small UDP layer for network play, on Winsock and BSD sockets alike. IPv4 only: LAN addresses,
+// Tailscale's 100.64.0.0/10 ones and the public addresses Direct Connect types in are all the game
+// needs. Names (Tailscale MagicDNS, or a domain like mc.okayu.zip) resolve to their IPv4 addresses.
 namespace Netplay {
 
-// The well-known port rooms are discovered and played on.
+// The well-known port rooms are discovered and played on (a host may pick another: Config.toml's
+// [netplay] host_port).
 inline constexpr uint16_t kDefaultPort = 52130;
 
 struct Address {
@@ -26,11 +28,23 @@ std::string ToString(const Address& address);
 std::string IpToString(uint32_t ip);
 // "a.b.c.d" or "a.b.c.d:port" (numeric only); `defaultPort` when no port is given.
 bool ParseAddress(std::string_view text, uint16_t defaultPort, Address& out);
+// What a player typed, "host" or "host:port", checked and split without looking anything up: host
+// is an IPv4 address or a name (lowercased, without a trailing dot), port 1-65535 or `defaultPort`.
+// Surrounding spaces and a pasted "scheme://" or "/path" are ignored; IPv6 is refused. False with a
+// message for the player in `error` when the text can't be an address.
+bool SplitHostPort(std::string_view text, uint16_t defaultPort, std::string& host, uint16_t& port,
+                   std::string* error = nullptr);
 // Numeric address, or a host name through the system resolver (Tailscale MagicDNS names work while
 // Tailscale is up). Blocks; call from the network thread.
 bool ResolveAddress(const std::string& text, uint16_t defaultPort, Address& out);
+// Every IPv4 address `host` (an address or a name, as SplitHostPort gives it) stands for, each with
+// `port`; empty when the name doesn't resolve. Blocks; never call it on the game thread.
+std::vector<Address> ResolveAll(const std::string& host, uint16_t port);
 // 100.64.0.0/10, where Tailscale numbers its devices.
 bool IsTailscaleIp(uint32_t ip);
+// An address that only means something on a local network or a tailnet: 10/8, 172.16/12,
+// 192.168/16, 169.254/16 and Tailscale's 100.64/10.
+bool IsPrivateIp(uint32_t ip);
 
 class UdpSocket {
 public:

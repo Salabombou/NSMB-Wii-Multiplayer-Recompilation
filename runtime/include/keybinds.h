@@ -57,8 +57,12 @@ void BeginCapture(int action);
 int Capturing();
 // Polls the keyboard during a capture; true once it has ended (bound or cancelled).
 bool PollCapture();
-// Keys held from a capture are ignored until they are released.
+// Keys held from a capture are ignored until they are released, and so is the whole keyboard while
+// text is typed (SetTextEntry, or an ImGui text field) and until the keys typed with are let go.
 bool Suppressed();
+// A text field of the game's own menus (Direct Connect's address) has the keyboard: letters, Space
+// and Enter type rather than press the remote's buttons.
+void SetTextEntry(bool on);
 void ResetDefaults();
 
 } // namespace Keybinds

@@ -9,12 +9,16 @@ import android.os.Bundle;
 import android.provider.Settings;
 import android.os.Process;
 import android.system.Os;
+import android.text.InputType;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.view.inputmethod.EditorInfo;
+import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.Toast;
 
 import org.libsdl.app.SDLActivity;
@@ -47,6 +51,8 @@ public class GameActivity extends SDLActivity
     /** A tap on the game's menus, as fractions of the screen. */
     static native void nativeTap(float x, float y);
     static native void nativePointer(float x, float y, boolean held);
+    /** Direct Connect's address as typed in askDirectAddress's text box; connect: join it now. */
+    static native void nativeDirectAddress(String text, boolean connect);
     /** Whether a menu that taps drive is up (the remote is hidden then). */
     static native boolean nativeTapScreen();
     /** Whether the player is in a course or on the world map with no menu up. */
@@ -490,6 +496,85 @@ public class GameActivity extends SDLActivity
         runOnUiThread(() -> leaveFor(new Intent(this, LauncherActivity.class)
                 .putExtra(LauncherActivity.EXTRA_RESTART_GAME, true)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP)));
+    }
+
+    // --- Direct Connect (runtime/src/netplay/netplay_ui.cpp) ------------------------------------
+
+    /**
+     * Direct Connect's address field, picked: the phone's own text box, with what the field holds.
+     * Connect joins the address at once, Done only keeps it in the field. Called from the game thread.
+     */
+    void askDirectAddress(String current) {
+        runOnUiThread(() -> {
+            touch.release();
+            final EditText input = new EditText(this);
+            input.setText(current);
+            input.setSelection(input.getText().length());
+            input.setHint("e.g. 203.0.113.5 or example.com:52130");
+            input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI
+                    | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+            input.setSingleLine(true);
+            input.setImeOptions(EditorInfo.IME_ACTION_GO | EditorInfo.IME_FLAG_NO_EXTRACT_UI);
+            final int pad = Math.round(20 * getResources().getDisplayMetrics().density);
+            final LinearLayout box = new LinearLayout(this);
+            box.setPadding(pad, pad / 2, pad, 0);
+            box.addView(input, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT));
+            final AlertDialog dialog = new AlertDialog.Builder(this)
+                    .setTitle("Direct Connect")
+                    .setMessage("The host's IP address or name, and :port if it isn't 52130.")
+                    .setView(box)
+                    .setPositiveButton("Connect", (d, w) -> sendDirectAddress(input, true))
+                    .setNeutralButton("Done", (d, w) -> sendDirectAddress(input, false))
+                    .setNegativeButton("Cancel", null)
+                    .create();
+            input.setOnEditorActionListener((v, actionId, event) -> {
+                if (actionId != EditorInfo.IME_ACTION_GO) return false;
+                sendDirectAddress(input, true);
+                dialog.dismiss();
+                return true;
+            });
+            dialog.setOnDismissListener(d -> hideSystemBars());
+            if (dialog.getWindow() != null) {
+                dialog.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+            }
+            dialog.show();
+            input.requestFocus();
+        });
+    }
+
+    private void sendDirectAddress(EditText input, boolean connect) {
+        if (!nativeReady) return;
+        nativeDirectAddress(input.getText().toString().replaceAll("\\s+", ""), connect);
+    }
+
+    /**
+     * The body of an HTTPS GET of url (at most 256 bytes), or "" on any failure: the public IP
+     * address a host shows Direct Connect players (runtime/src/netplay/public_ip.cpp). Blocks; called
+     * on one of the game's own threads, never the UI thread.
+     */
+    String httpGetText(String url) {
+        java.net.HttpURLConnection connection = null;
+        try {
+            connection = (java.net.HttpURLConnection) new java.net.URL(url).openConnection();
+            connection.setConnectTimeout(5000);
+            connection.setReadTimeout(5000);
+            connection.setRequestProperty("User-Agent", "NSMBW-Netplay");
+            if (connection.getResponseCode() != java.net.HttpURLConnection.HTTP_OK) return "";
+            try (java.io.InputStream in = connection.getInputStream()) {
+                final byte[] buffer = new byte[256];
+                int total = 0, read;
+                while (total < buffer.length && (read = in.read(buffer, total, buffer.length - total)) > 0) {
+                    total += read;
+                }
+                return new String(buffer, 0, total, java.nio.charset.StandardCharsets.US_ASCII);
+            }
+        } catch (Exception e) {
+            Log.i(TAG, "public IP lookup failed: " + e.getMessage());
+            return "";
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
     }
 
     @Override

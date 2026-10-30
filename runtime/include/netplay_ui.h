@@ -3,12 +3,16 @@
 #include "wii_remote_input.h"
 
 #include <cstdint>
+#include <string>
 
 // The network-play menus, drawn with the game's own window and font graphics (netplay/game_layout.h):
 //   - a Couch / LAN button at the top right of the file select (Couch by default);
-//   - for LAN: "Join" or "Create Room"; Create Room goes on to the game's own player-count screen
-//     and then the room, where the host starts or cancels it; Join lists the rooms found on the LAN
-//     and over Tailscale;
+//   - for LAN: "Join", "Create Room" or "Direct Connect"; Create Room goes on to the game's own
+//     player-count screen and then the room, where the host starts or cancels it (and sees the
+//     addresses Direct Connect players type); Join lists the rooms found on the LAN and over
+//     Tailscale; Direct Connect types the host's IP address or name (and :port) into a field, with
+//     the keyboard on a PC, the phone's own text box, or an on-screen keyboard for a controller or
+//     the remote alone;
 //   - starting a room restarts every device into the network session.
 namespace NetplayUi {
 
@@ -37,6 +41,9 @@ bool TapScreenUp();
 // True while the player is playing: in a course or on the world map, with no pause menu, settings
 // window or other menu up. The Android app shows its hidden on-screen remote again on a tap then.
 bool Playing();
+// Direct Connect's address as typed in the Android app's text box (GameActivity.askDirectAddress,
+// any thread): it replaces the field's text, and `connect` connects to it at once.
+void SetDirectAddress(const std::string& text, bool connect);
 // The settings window changed the render scale, the aspect or the FPS counter since the last call:
 // the Android app copies them into its own settings, which it writes to Config.toml at every start.
 // touchControls and renderer are -1 when unchanged; renderer is an index into the Video tab's list

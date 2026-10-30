@@ -10,6 +10,7 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -30,7 +31,8 @@ import java.util.List;
  * LAN play's devices: this phone's addresses for other players, and the devices the game asks for
  * rooms directly, since Tailscale carries no broadcasts. The game keeps them in Netplay/hosts.txt
  * (netplay_lobby.h) and adds the ones it meets; here the player can add a device's Tailscale name
- * or address by hand, or remove one.
+ * or address by hand, or remove one. Also the UDP port this phone hosts rooms on (Config.toml's
+ * [netplay] host_port), which Direct Connect players over the internet reach through the router.
  */
 final class DevicesDialog {
     private DevicesDialog() {}
@@ -130,6 +132,20 @@ final class DevicesDialog {
             column.addView(row);
         }
 
+        // Direct Connect: over the internet, the host's router forwards this port to it.
+        column.addView(label(activity, Lang.t("Direct Connect"), 17, true));
+        column.addView(label(activity, Lang.t("To play over the internet, the host forwards its UDP port on its router. "
+                + "The others pick LAN > Direct Connect in the game and type the host's internet address or "
+                + "name, with :port if it isn't 52130."), 13, false));
+        final TextView portRow = label(activity, Lang.f("Host port: UDP %d   (change)", AppFiles.hostPort(activity)),
+                15, false);
+        portRow.setPadding(0, Math.round(8 * density), 0, Math.round(8 * density));
+        portRow.setOnClickListener(v -> {
+            dialog[0].dismiss();
+            askHostPort(activity);
+        });
+        column.addView(portRow);
+
         final ScrollView scroll = new ScrollView(activity);
         scroll.addView(column);
         dialog[0] = new AlertDialog.Builder(activity)
@@ -167,6 +183,53 @@ final class DevicesDialog {
                 })
                 .setNegativeButton(Lang.t("Cancel"), (d, w) -> show(activity))
                 .show();
+    }
+
+    private static void askHostPort(Activity activity) {
+        final EditText input = new EditText(activity);
+        input.setText(Integer.toString(AppFiles.hostPort(activity)));
+        input.setInputType(InputType.TYPE_CLASS_NUMBER);
+        input.setSingleLine(true);
+        input.setSelection(input.getText().length());
+        final float density = activity.getResources().getDisplayMetrics().density;
+        final LinearLayout box = new LinearLayout(activity);
+        final int pad = Math.round(20 * density);
+        box.setPadding(pad, pad / 2, pad, 0);
+        box.addView(input, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        new AlertDialog.Builder(activity)
+                .setTitle(Lang.t("Host Port"))
+                .setMessage(Lang.f("The UDP port rooms on this phone use, from 1024 to 65535 (%d unless changed). "
+                        + "Direct Connect players over the internet need it forwarded on the router.",
+                        AppFiles.DEFAULT_HOST_PORT))
+                .setView(box)
+                .setPositiveButton(Lang.t("Save"), (d, w) -> {
+                    int port = -1;
+                    try {
+                        port = Integer.parseInt(input.getText().toString().trim());
+                    } catch (NumberFormatException ignored) {
+                        // not a number: refused below
+                    }
+                    saveHostPort(activity, port);
+                    show(activity);
+                })
+                .setNeutralButton(Lang.f("Use %d", AppFiles.DEFAULT_HOST_PORT), (d, w) -> {
+                    saveHostPort(activity, AppFiles.DEFAULT_HOST_PORT);
+                    show(activity);
+                })
+                .setNegativeButton(Lang.t("Cancel"), (d, w) -> show(activity))
+                .show();
+    }
+
+    private static void saveHostPort(Activity activity, int port) {
+        try {
+            if (!AppFiles.setHostPort(activity, port)) {
+                Toast.makeText(activity, Lang.t("The port must be a number from 1024 to 65535."), Toast.LENGTH_LONG)
+                        .show();
+            }
+        } catch (IOException e) {
+            android.util.Log.e("NSMBW", "could not save the host port", e);
+        }
     }
 
     private static TextView label(Activity activity, String text, int sp, boolean bold) {

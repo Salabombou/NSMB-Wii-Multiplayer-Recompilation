@@ -60,6 +60,7 @@ int g_capturing = -1;
 std::vector<bool> g_heldAtCapture;  // keys already down when the capture began
 uint32_t g_mouseHeldAtCapture = 0;  // likewise the mouse buttons (the click that started it)
 bool g_suppress = false;            // a capture just ended: ignore the keyboard until all keys are up
+std::atomic<bool> g_textEntry{false};  // a menu's text field has the keyboard (SetTextEntry)
 std::atomic<int> g_smartSpin{-1};   // Space Smart Spin QoL: -1 until read from Config.toml
 std::atomic<int> g_reverseTilt{-1};  // Reverse Tilt QoL: -1 until read from Config.toml
 std::atomic<int> g_mouseGyro{-1};    // Mouse Gyro QoL: -1 until read from Config.toml
@@ -301,10 +302,21 @@ bool PollCapture() {
 
 bool Suppressed() {
     std::lock_guard<std::mutex> lock(g_mutex);
+    // Typing: the keys are letters, not the remote's buttons. The ones still down when it ends
+    // (Enter, which is also +) wait for their release, like a capture's.
+    if (g_textEntry.load(std::memory_order_relaxed) ||
+        (ImGui::GetCurrentContext() != nullptr && ImGui::GetIO().WantTextInput)) {
+        g_suppress = true;
+        return true;
+    }
     if (g_suppress && !AnyKeyDown()) {
         g_suppress = false;
     }
     return g_capturing >= 0 || g_suppress;
+}
+
+void SetTextEntry(bool on) {
+    g_textEntry.store(on, std::memory_order_relaxed);
 }
 
 void ResetDefaults() {

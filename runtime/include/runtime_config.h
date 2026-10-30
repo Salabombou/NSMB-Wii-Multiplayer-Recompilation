@@ -56,6 +56,7 @@ struct RuntimeUserConfig {
     std::optional<uint32_t> frameGraphSize;  // NSMBW: [video] frame_graph_size, percent (5-200; 50 = the original size)
     std::optional<bool> vsync;          // NSMBW: [video] vsync, presents wait for the display (Windows)
     std::optional<std::string> language;  // NSMBW: [game] language, "en" "es" or "fr" (the USA disc's three)
+    std::optional<uint32_t> netplayHostPort;  // NSMBW: [netplay] host_port, the UDP port rooms are hosted on (1024-65535)
     std::optional<uint32_t> disabledPostProcessingPaths;
     std::optional<float> audioVolume;
     std::optional<float> audioMusicVolume;
@@ -593,6 +594,9 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
         value && (*value == "en" || *value == "es" || *value == "fr")) {
         config.language = *value;
     }
+    if (auto value = FindConfigUint(document, "netplay", "host_port"); value && *value >= 1024 && *value <= 65535) {
+        config.netplayHostPort = *value;
+    }
     config.textureReplacements = FindConfigValue<bool>(document, "video", "texture_replacements");
     config.textureDumps = FindConfigValue<bool>(document, "video", "texture_dumps");
     if (auto value = FindConfigUint(document, "video", "disabled_post_processing_paths");
@@ -843,6 +847,25 @@ inline bool SetLanguage(const std::string& value) {
     }
     Mutable().language = value;
     return WriteSetting("game", "language", FormatString(value));
+}
+
+// NSMBW: the UDP port a network-play room is hosted on (Direct Connect players type it after the
+// address); `fallback` is the game's own, 52130. Ports below 1024 need special rights on Linux and
+// Android, so they are not offered.
+inline constexpr uint32_t kNetplayHostPortMin = 1024;
+inline constexpr uint32_t kNetplayHostPortMax = 65535;
+
+inline uint16_t NetplayHostPort(uint16_t fallback) {
+    const uint32_t port = Get().netplayHostPort.value_or(fallback);
+    return static_cast<uint16_t>(port >= kNetplayHostPortMin && port <= kNetplayHostPortMax ? port : fallback);
+}
+
+inline bool SetNetplayHostPort(uint32_t value) {
+    if (value < kNetplayHostPortMin || value > kNetplayHostPortMax) {
+        return false;
+    }
+    Mutable().netplayHostPort = value;
+    return WriteSetting("netplay", "host_port", std::to_string(value));
 }
 
 inline bool FrameGraph(bool fallback = false) {

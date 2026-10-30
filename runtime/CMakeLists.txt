@@ -415,6 +415,14 @@ target_include_directories(mkw_runtime_config_tests PRIVATE
 target_compile_features(mkw_runtime_config_tests PRIVATE cxx_std_20)
 add_test(NAME mkw_runtime_config_tests COMMAND mkw_runtime_config_tests)
 
+# Direct Connect's address text (host[:port], IPv4 or a name): parsed without sockets or the runtime.
+add_executable(mkw_netplay_address_tests
+    "${CMAKE_CURRENT_LIST_DIR}/tests/netplay_address_tests.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/netplay/net_address.cpp")
+target_include_directories(mkw_netplay_address_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/src")
+target_compile_features(mkw_netplay_address_tests PRIVATE cxx_std_17)
+add_test(NAME mkw_netplay_address_tests COMMAND mkw_netplay_address_tests)
+
 add_executable(mkw_nand_save_tests "${CMAKE_CURRENT_LIST_DIR}/tests/nand_save_tests.cpp")
 target_include_directories(mkw_nand_save_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 target_compile_features(mkw_nand_save_tests PRIVATE cxx_std_17)

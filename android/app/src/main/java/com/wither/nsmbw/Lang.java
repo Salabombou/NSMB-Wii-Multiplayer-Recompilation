@@ -338,5 +338,30 @@ final class Lang {
                 + "à partir de maintenant.");
         put("Add", "Añadir", "Ajouter");
         put("e.g. s26-ultra or 100.84.140.32", "p. ej. s26-ultra o 100.84.140.32", "ex. s26-ultra ou 100.84.140.32");
+
+        // --- Direct Connect (in the Tailscale & LAN Devices dialog) ---
+        put("Direct Connect", "Conexión directa", "Connexion directe");
+        put("To play over the internet, the host forwards its UDP port on its router. The others pick LAN > "
+                + "Direct Connect in the game and type the host's internet address or name, with :port if it "
+                + "isn't 52130.",
+                "Para jugar por internet, el anfitrión redirige su puerto UDP en su router. Los demás eligen "
+                + "LAN > Direct Connect en el juego y escriben la dirección de internet o el nombre del "
+                + "anfitrión, con :puerto si no es 52130.",
+                "Pour jouer par internet, l'hôte redirige son port UDP sur sa box. Les autres choisissent "
+                + "LAN > Direct Connect dans le jeu et tapent l'adresse internet ou le nom de l'hôte, avec "
+                + ":port s'il n'est pas 52130.");
+        put("Host port: UDP %d   (change)", "Puerto del anfitrión: UDP %d   (cambiar)",
+                "Port de l'hôte : UDP %d   (modifier)");
+        put("Host Port", "Puerto del anfitrión", "Port de l'hôte");
+        put("The UDP port rooms on this phone use, from 1024 to 65535 (%d unless changed). Direct Connect "
+                + "players over the internet need it forwarded on the router.",
+                "El puerto UDP que usan las salas de este teléfono, de 1024 a 65535 (%d si no se cambia). Los "
+                + "jugadores de Direct Connect por internet lo necesitan redirigido en el router.",
+                "Le port UDP qu'utilisent les salles de ce téléphone, de 1024 à 65535 (%d sauf changement). "
+                + "Les joueurs Direct Connect par internet ont besoin qu'il soit redirigé sur la box.");
+        put("Save", "Guardar", "Enregistrer");
+        put("Use %d", "Usar %d", "Utiliser %d");
+        put("The port must be a number from 1024 to 65535.", "El puerto debe ser un número de 1024 a 65535.",
+                "Le port doit être un nombre de 1024 à 65535.");
     }
 }

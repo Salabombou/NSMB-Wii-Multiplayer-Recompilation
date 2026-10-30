@@ -65,6 +65,69 @@ bool StartAppUpdate() {
     return true;
 }
 
+// Direct Connect's field (netplay_ui.cpp): GameActivity.askDirectAddress shows the phone's own text
+// box with `current` in it; its answer comes back through nativeDirectAddress.
+bool AskDirectAddress(const std::string& current) {
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (env == nullptr || activity == nullptr) {
+        return false;
+    }
+    jclass type = env->GetObjectClass(activity);
+    jmethodID ask = type != nullptr ? env->GetMethodID(type, "askDirectAddress", "(Ljava/lang/String;)V") : nullptr;
+    if (ask == nullptr) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(activity);
+        return false;
+    }
+    jstring text = env->NewStringUTF(current.c_str());
+    env->CallVoidMethod(activity, ask, text);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+    env->DeleteLocalRef(text);
+    env->DeleteLocalRef(type);
+    env->DeleteLocalRef(activity);
+    return true;
+}
+
+// The body of an HTTPS GET of `url` ("" on any failure), through GameActivity.httpGetText; for the
+// public IP lookup (netplay/public_ip.cpp), on its own thread, which SDL attaches to Java.
+std::string HttpGetText(const std::string& url) {
+    auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+    auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (env == nullptr || activity == nullptr) {
+        return {};
+    }
+    std::string body;
+    jclass type = env->GetObjectClass(activity);
+    jmethodID get =
+        type != nullptr ? env->GetMethodID(type, "httpGetText", "(Ljava/lang/String;)Ljava/lang/String;") : nullptr;
+    if (get != nullptr) {
+        jstring address = env->NewStringUTF(url.c_str());
+        auto result = static_cast<jstring>(env->CallObjectMethod(activity, get, address));
+        if (env->ExceptionCheck()) {
+            env->ExceptionClear();
+            result = nullptr;
+        }
+        if (result != nullptr) {
+            if (const char* utf8 = env->GetStringUTFChars(result, nullptr)) {
+                body = utf8;
+                env->ReleaseStringUTFChars(result, utf8);
+            }
+            env->DeleteLocalRef(result);
+        }
+        env->DeleteLocalRef(address);
+    } else {
+        env->ExceptionClear();
+    }
+    if (type != nullptr) {
+        env->DeleteLocalRef(type);
+    }
+    env->DeleteLocalRef(activity);
+    return body;
+}
+
 } // namespace AndroidBridge
 
 extern "C" {
@@ -156,6 +219,21 @@ JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativePointer(JNIEnv*,
                                                                       jboolean held)
 {
     NetplayUi::Pointer(x, y, held != JNI_FALSE);
+}
+
+// GameActivity.nativeDirectAddress: what was typed in Direct Connect's text box, and whether to
+// connect to it now (netplay_ui.h).
+JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativeDirectAddress(JNIEnv* env, jclass, jstring text,
+                                                                            jboolean connect)
+{
+    std::string address;
+    if (text != nullptr) {
+        if (const char* utf8 = env->GetStringUTFChars(text, nullptr)) {
+            address = utf8;
+            env->ReleaseStringUTFChars(text, utf8);
+        }
+    }
+    NetplayUi::SetDirectAddress(address, connect != JNI_FALSE);
 }
 
 JNIEXPORT void JNICALL Java_com_wither_nsmbw_GameActivity_nativeTap(JNIEnv*, jclass, jfloat x, jfloat y)

@@ -1,4 +1,5 @@
 #include "netplay/game_layout.h"
+#include "netplay/public_ip.h"
 #include "netplay_lobby.h"
 #include "netplay_ui.h"
 #include "settings_overlay.h"
@@ -1069,7 +1070,8 @@ void DrawAudioSettings() {
 
 // LAN Play: this PC's addresses for other players, and the devices asked for rooms directly
 // (Tailscale doesn't carry broadcasts; netplay_lobby.h). Peers from `tailscale status` are asked
-// anyway; this is for typing in a device's Tailscale name or address by hand.
+// anyway; this is for typing in a device's Tailscale name or address by hand. Also Direct Connect's
+// side of hosting: the UDP port rooms are hosted on, and this PC's public address.
 void DrawLanPlaySettings() {
     static std::vector<std::string> ownAddresses;
     static uint64_t ownAddressesAt = 0;
@@ -1077,13 +1079,49 @@ void DrawLanPlaySettings() {
         ownAddresses = NetplayLobby::OwnAddresses();
         ownAddressesAt = SDL_GetTicks();
     }
+    const std::string port = ":" + std::to_string(NetplayLobby::HostPort());
     ImGui::TextUnformatted("Rooms are found on your Wi-Fi by themselves, and over Tailscale through");
     ImGui::TextUnformatted("the devices in `tailscale status` and the ones below.");
     ImGui::Separator();
     ImGui::TextUnformatted("This PC (tell other players one of these):");
     for (const auto& address : ownAddresses) {
-        ImGui::BulletText("%s%s", address.c_str(), address.rfind("100.", 0) == 0 ? "  (Tailscale)" : "");
+        ImGui::BulletText("%s%s%s", address.c_str(), port.c_str(), address.rfind("100.", 0) == 0 ? "  (Tailscale)" : "");
     }
+    const PublicIp::Result publicIp = PublicIp::Get();
+    if (publicIp.state == PublicIp::State::Known) {
+        ImGui::BulletText("%s%s  (internet, for Direct Connect)", publicIp.ip.c_str(), port.c_str());
+    } else if (publicIp.state == PublicIp::State::Looking) {
+        ImGui::BulletText("looking up the internet address...");
+    } else {
+        if (publicIp.state == PublicIp::State::Failed) {
+            ImGui::BulletText("internet address unknown");
+            ImGui::SameLine();
+        }
+        if (ImGui::SmallButton("Look up internet address")) {
+            PublicIp::Request(true);
+        }
+    }
+    ImGui::Separator();
+    ImGui::TextUnformatted("Direct Connect (over the internet):");
+    static int hostPort = 0;
+    if (hostPort == 0 || !ImGui::IsAnyItemActive()) {
+        hostPort = NetplayLobby::HostPort();
+    }
+    ImGui::SetNextItemWidth(140.0f);
+    const bool entered = ImGui::InputInt("Host port (UDP, 1024-65535)", &hostPort, 1, 100,
+                                         ImGuiInputTextFlags_EnterReturnsTrue);
+    if (entered || ImGui::IsItemDeactivatedAfterEdit()) {
+        hostPort = std::clamp(hostPort, static_cast<int>(RuntimeConfigFile::kNetplayHostPortMin),
+                              static_cast<int>(RuntimeConfigFile::kNetplayHostPortMax));
+        RuntimeConfigFile::SetNetplayHostPort(static_cast<uint32_t>(hostPort));
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Default")) {
+        RuntimeConfigFile::SetNetplayHostPort(52130);
+        hostPort = 52130;
+    }
+    ImGui::TextDisabled("Rooms you create use this port; forward it (UDP) on your router to this PC.");
+    ImGui::TextDisabled("Others pick LAN > Direct Connect and type your internet address or a name, :port.");
     ImGui::Separator();
     ImGui::TextUnformatted("Devices asked for rooms directly:");
     const auto known = NetplayLobby::KnownDevices();

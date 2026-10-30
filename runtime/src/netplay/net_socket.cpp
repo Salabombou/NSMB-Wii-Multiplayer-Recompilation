@@ -2,6 +2,7 @@
 
 #include "runtime_log.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <atomic>
@@ -66,93 +67,53 @@ std::string g_deviceName;
 
 } // namespace
 
-std::string IpToString(uint32_t ip) {
-    char text[16];
-    std::snprintf(text, sizeof(text), "%u.%u.%u.%u", (ip >> 24) & 0xFF, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
-    return text;
-}
+// IpToString, ToString, ParseAddress, SplitHostPort and the address ranges: net_address.cpp.
 
-std::string ToString(const Address& address) {
-    return IpToString(address.ip) + ":" + std::to_string(address.port);
-}
-
-bool ParseAddress(std::string_view text, uint16_t defaultPort, Address& out) {
-    uint32_t parts[4] = {};
-    size_t index = 0;
-    size_t pos = 0;
-    for (; index < 4; ++index) {
-        if (pos >= text.size() || text[pos] < '0' || text[pos] > '9') {
-            return false;
-        }
-        uint32_t value = 0;
-        while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9') {
-            value = value * 10 + static_cast<uint32_t>(text[pos++] - '0');
-            if (value > 255) {
-                return false;
-            }
-        }
-        parts[index] = value;
-        if (index < 3) {
-            if (pos >= text.size() || text[pos] != '.') {
-                return false;
-            }
-            ++pos;
-        }
+std::vector<Address> ResolveAll(const std::string& host, uint16_t port) {
+    std::vector<Address> found;
+    if (Address numeric; ParseAddress(host, port, numeric)) {
+        found.push_back(numeric);
+        return found;
     }
-    uint32_t port = defaultPort;
-    if (pos < text.size()) {
-        if (text[pos] != ':') {
-            return false;
-        }
-        ++pos;
-        port = 0;
-        if (pos >= text.size()) {
-            return false;
-        }
-        for (; pos < text.size(); ++pos) {
-            if (text[pos] < '0' || text[pos] > '9') {
-                return false;
-            }
-            port = port * 10 + static_cast<uint32_t>(text[pos] - '0');
-            if (port > 65535) {
-                return false;
-            }
-        }
-    }
-    out.ip = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
-    out.port = static_cast<uint16_t>(port);
-    return out.ip != 0 && out.port != 0;
-}
-
-bool ResolveAddress(const std::string& text, uint16_t defaultPort, Address& out) {
-    if (ParseAddress(text, defaultPort, out)) {
-        return true;
-    }
-    if (!EnsureWinsock()) {
-        return false;
-    }
-    std::string host = text;
-    uint16_t port = defaultPort;
-    if (const size_t colon = text.rfind(':'); colon != std::string::npos) {
-        host = text.substr(0, colon);
-        port = static_cast<uint16_t>(std::strtoul(text.c_str() + colon + 1, nullptr, 10));
+    if (host.empty() || port == 0 || !EnsureWinsock()) {
+        return found;
     }
     addrinfo hints{};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     addrinfo* result = nullptr;
     if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || result == nullptr) {
-        return false;
+        return found;
     }
-    const auto* in = reinterpret_cast<const sockaddr_in*>(result->ai_addr);
-    out.ip = ntohl(in->sin_addr.s_addr);
-    out.port = port;
+    // Every A record, in the resolver's order: a name may stand for several hosts.
+    for (const addrinfo* item = result; item != nullptr; item = item->ai_next) {
+        if (item->ai_family != AF_INET || item->ai_addr == nullptr) {
+            continue;
+        }
+        const Address address{ntohl(reinterpret_cast<const sockaddr_in*>(item->ai_addr)->sin_addr.s_addr), port};
+        if (address.Valid() && std::find(found.begin(), found.end(), address) == found.end()) {
+            found.push_back(address);
+        }
+    }
     freeaddrinfo(result);
-    return out.Valid();
+    return found;
 }
 
-bool IsTailscaleIp(uint32_t ip) {
-    return (ip & 0xFFC00000u) == 0x64400000u;  // 100.64.0.0/10
+bool ResolveAddress(const std::string& text, uint16_t defaultPort, Address& out) {
+    if (ParseAddress(text, defaultPort, out)) {
+        return true;
+    }
+    std::string host;
+    uint16_t port = 0;
+    if (!SplitHostPort(text, defaultPort, host, port)) {
+        return false;
+    }
+    const std::vector<Address> found = ResolveAll(host, port);
+    if (found.empty()) {
+        return false;
+    }
+    out = found.front();
+    return true;
 }
 
 UdpSocket::~UdpSocket() {

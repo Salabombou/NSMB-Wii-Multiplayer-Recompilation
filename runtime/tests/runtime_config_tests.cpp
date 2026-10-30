@@ -31,5 +31,24 @@ int main() {
         const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "invalid.toml");
         if (!Require(!config.metalFxSpatialUpscaling, "invalid MetalFX setting was accepted")) return 1;
     }
+    {
+        std::istringstream input("[netplay]\nhost_port = 6000\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "netplay-port.toml");
+        if (!Require(config.netplayHostPort == std::optional<uint32_t>{6000},
+                     "valid netplay host port was not loaded")) return 1;
+    }
+    {
+        std::istringstream input("[netplay]\nhost_port = 65535\n");
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "netplay-port-max.toml");
+        if (!Require(config.netplayHostPort == std::optional<uint32_t>{65535},
+                     "highest netplay host port was not loaded")) return 1;
+    }
+    for (const char* text : {"[netplay]\nhost_port = 80\n", "[netplay]\nhost_port = 70000\n",
+                             "[netplay]\nhost_port = -1\n", "[netplay]\nhost_port = \"6000\"\n",
+                             "[video]\nhost_port = 6000\n"}) {
+        std::istringstream input(text);
+        const RuntimeUserConfig config = RuntimeConfigFile::ParseConfig(input, "netplay-port-invalid.toml");
+        if (!Require(!config.netplayHostPort, "invalid netplay host port was accepted")) return 1;
+    }
     return 0;
 }

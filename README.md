@@ -46,14 +46,16 @@ Claude Opus 5.5.**
 The whole game is compiled to ARM64 code ahead of time. It runs at a full 60 fps on a
 Snapdragon 6 Gen 1 phone.
 
-**LAN and Tailscale multiplayer across phones and PCs.**
+**LAN, Tailscale and Direct Connect multiplayer across phones and PCs.**
 On the save file screen, a **Couch / LAN** button sits at the top right (Couch by default). Switch it
 to **LAN** to **Create Room** (choose how many are playing, then start the room when everyone is
 in) or **Join** a room from a list that finds
 games by itself: on your Wi-Fi, and over the internet on your [Tailscale](https://tailscale.com)
-network, phones included. Every device runs the game and only the players' inputs travel, in
-lockstep. If a player drops, the others get a message instead of a frozen game, and the host keeps
-the progress. See [LAN and Tailscale multiplayer](#lan-and-tailscale-multiplayer).
+network, phones included. **Direct Connect** joins a room over the internet by the host's IP
+address or a name (like `play.example.com:52130`) instead. Every device runs the game and only the
+players' inputs travel, in lockstep. If a player drops, the others get a message instead of a frozen
+game, and the host keeps the progress. See
+[LAN, Tailscale and Direct Connect multiplayer](#lan-tailscale-and-direct-connect-multiplayer).
 
 **Tap the menus.**
 Tap (or click with the mouse on Windows) what you want on the game's menus: the title screen,
@@ -238,7 +240,7 @@ start menu.
 Every key can be changed in the gear's **Keybinds** tab on the save file screen. A game controller
 also works on Windows as a sideways Wii Remote (remap it under F10 > Controls).
 
-## LAN and Tailscale multiplayer
+## LAN, Tailscale and Direct Connect multiplayer
 
 <p align="center">
   <img src="docs/screenshots/windows-lan-couch-toggle.png" alt="The Couch / LAN button at the top right of the Select a File screen, on Windows" width="640">
@@ -249,7 +251,8 @@ Up to 4 players, on any mix of phones and PCs. Every player needs their own game
 
 1. One player presses Up on the save file screen to reach the **Couch** button at the top right,
    switches it to **LAN**, then picks **Create Room** and how many are playing.
-2. The others switch it to **LAN** too, pick **Join**, and choose the room from the list.
+2. The others switch it to **LAN** too, pick **Join**, and choose the room from the list (or pick
+   **Direct Connect** and type the host's address, see below).
 3. The host starts the room. Every device restarts into the session with the host's save, and the
    game goes to the player select by itself.
 
@@ -274,6 +277,28 @@ was tested between the Windows PC and the REVVL 7 over Tailscale alone, in both 
 
 Windows asks to let the game through the firewall the first time you host a room; allow it, or
 others can't find your room. **Couch** is the normal local multiplayer on one device.
+
+### Direct Connect (IP address or name)
+
+Play over the internet without Tailscale by typing the host's address:
+
+- **Joining:** on the **LAN** screen pick **Direct Connect** and type the host's IP address or a
+  name that points to it, with `:port` when the host's port isn't 52130: `203.0.113.5`,
+  `203.0.113.5:6000` or `play.example.com:52130`. Names are looked up (DNS) when you connect, so a
+  domain (or a dynamic DNS name) for the host's internet connection works. On a PC, type with the
+  keyboard (Ctrl+V pastes, Enter connects, Esc goes back); on a phone, tap the field for the phone's
+  keyboard; with a controller or the remote alone, use the on-screen keyboard (**+** connects,
+  **-** erases). The last address that worked is filled in next time.
+- **Hosting:** create a room as usual. The room's window shows your internet address (looked up
+  from api.ipify.org, or ipv4.icanhazip.com, while the room is open) and your address on the local
+  network, each with the port. On your router, forward that **UDP** port to the hosting device.
+  Players on the same Wi-Fi can still use **Join** (or Direct Connect with the local address).
+- **Port:** rooms use UDP **52130**. To use another (1024-65535), set **Host port** under
+  **F10 > LAN Play** on a PC or in **Tailscale & LAN Devices** on Android (Config.toml's
+  `[netplay] host_port`). A room on another port still shows up on phones, Linux PCs and through
+  Direct Connect; Windows PCs only find it with Direct Connect.
+- If nobody can reach your room, your internet provider may share one address between many
+  customers (CGNAT), which no port forward gets through. Use Tailscale then.
 
 ## Building from source
 
