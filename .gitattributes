@@ -3,4 +3,6 @@
 
 # Patch files must stay LF: git apply matches context bytes against LF upstream sources
 *.patch -text
+# Windows batch files: cmd.exe misreads labels and long lines in LF-only files
+*.cmd text eol=crlf
 translator/tests/Translator.Tests/TestAssets/**/*.bin binary

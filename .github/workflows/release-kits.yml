@@ -1,0 +1,81 @@
+name: Release build kits
+
+# Attaches a Windows and a Linux build kit to a release: this repository's source and a one-step script
+# (projects/nsmbw/kit) that builds the game on the player's PC from their own disc. The kits hold none of
+# the game: its code is translated from the player's disc during their build. The asset names avoid the
+# in-game updater's "-windows-x64.zip" / "-linux-x86_64.tar.gz", which mean a ready-to-run game.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach the kits to (for example v0.3.3)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-kits-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kits:
+    name: Package and attach the build kits
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Check the build scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n projects/nsmbw/tools/build-game.sh projects/nsmbw/tools/build-linux.sh projects/nsmbw/kit/build-nsmbw.sh
+          bash projects/nsmbw/tools/build-game.sh --help
+          pwsh -NoProfile -Command '
+            $failed = $false
+            foreach ($file in "projects/nsmbw/tools/build-game.ps1", "projects/nsmbw/tools/rebuild-all.ps1", "projects/nsmbw/tools/configure-native.ps1") {
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$null, [ref]$errors)
+              foreach ($e in $errors) { Write-Host "::error file=$file,line=$($e.Extent.StartLineNumber)::$($e.Message)"; $failed = $true }
+            }
+            if ($failed) { exit 1 }'
+
+      - name: Package the kits
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p dist
+          for platform in windows-x64 linux-x86_64; do
+            kit="dist/NSMBW-$version-$platform-builder"
+            mkdir -p "$kit"
+            # The Android app and the docs' screenshots aren't needed to build for a PC.
+            git archive --format=tar --prefix=source/ HEAD -- . ':(exclude)android' ':(exclude)docs' | tar -x -C "$kit"
+            cp projects/nsmbw/kit/README.txt "$kit/"
+          done
+          cp projects/nsmbw/kit/Build-NSMBW.cmd "dist/NSMBW-$version-windows-x64-builder/"
+          install -m 755 projects/nsmbw/kit/build-nsmbw.sh "dist/NSMBW-$version-linux-x86_64-builder/"
+          (cd dist && zip -qr9 "NSMBW-$version-windows-x64-builder.zip" "NSMBW-$version-windows-x64-builder")
+          (cd dist && tar -czf "NSMBW-$version-linux-x86_64-builder.tar.gz" "NSMBW-$version-linux-x86_64-builder")
+          ls -l dist/*.zip dist/*.tar.gz
+
+      - name: Attach to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          assets=(dist/*-builder.zip dist/*-builder.tar.gz)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --title "$TAG" --verify-tag --generate-notes
+          fi

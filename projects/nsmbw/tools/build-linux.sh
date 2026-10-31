@@ -6,7 +6,7 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: build-linux.sh [--newer NEWER_DIR] [--output DIR] [--game DIR] [--jobs N]
+Usage: build-linux.sh [--newer NEWER_DIR] [--output DIR] [--game DIR] [--jobs N] [--x86-level v3|v2]
 
   (no --newer)     the base game: ../game (unpack_game.py + prelink_rels.py), recomp.yml, native-build/
   --newer DIR      Newer Super Mario Bros. Wii, extracted with Dolphin (DIR holds DATA/ or files/ + sys/):
@@ -15,6 +15,7 @@ Usage: build-linux.sh [--newer NEWER_DIR] [--output DIR] [--game DIR] [--jobs N]
   --output DIR     where the game is put (default ../nsmbw-local-build or ../nsmbw-newer-build)
   --game DIR       extracted disc to link as DIR/game beside the game (skips the folder question)
   --jobs N         parallel jobs (default: CPU count; translated shards capped by RAM)
+  --x86-level L    v3 (default: AVX2 and FMA, Haswell and newer) or v2 (the compat build for older CPUs)
 
 Tools: dotnet (PATH or ~/.dotnet), and clang/cmake/ninja from Launcher/prepare-portable-tools.sh
 (Launcher/artifacts/portable-tools/toolchain-x86_64), or set TOOLCHAIN_BIN to another bin folder.
@@ -26,12 +27,14 @@ newer=""
 output=""
 game=""
 jobs=$(nproc)
+x86_level=v3
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --newer) newer=$2; shift 2 ;;
         --output) output=$2; shift 2 ;;
         --game) game=$2; shift 2 ;;
         --jobs) jobs=$2; shift 2 ;;
+        --x86-level) x86_level=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage; echo "build-linux.sh: unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -41,6 +44,8 @@ fail() {
     echo "build-linux.sh: error: $*" >&2
     exit 1
 }
+
+[[ "$x86_level" == v3 || "$x86_level" == v2 ]] || fail "--x86-level must be v3 or v2"
 
 step() {
     printf '\n== %s\n' "$*"
@@ -114,7 +119,8 @@ configure=(-S runtime -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release
     -DCMAKE_AR="$bin/llvm-ar" -DCMAKE_C_COMPILER_AR="$bin/llvm-ar" -DCMAKE_CXX_COMPILER_AR="$bin/llvm-ar"
     -DCMAKE_RANLIB="$bin/llvm-ranlib" -DCMAKE_C_COMPILER_RANLIB="$bin/llvm-ranlib"
     -DCMAKE_CXX_COMPILER_RANLIB="$bin/llvm-ranlib" -DCMAKE_LINKER="$bin/ld.lld" -DCMAKE_ASM_COMPILER="$bin/clang"
-    -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DMKW_TRANSLATED_COMPILE_JOBS="$shard_jobs" -DNSMBW_GAME_ID="$game_id")
+    -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DMKW_TRANSLATED_COMPILE_JOBS="$shard_jobs" -DNSMBW_GAME_ID="$game_id"
+    -DMKW_X86_LEVEL="$x86_level")
 # SDL3 refuses to configure without these X11 extensions' headers unless they are switched off.
 pkg-config --exists xscrnsaver 2>/dev/null || configure+=(-DSDL_X11_XSCRNSAVER=OFF)
 pkg-config --exists xtst 2>/dev/null || configure+=(-DSDL_X11_XTEST=OFF)

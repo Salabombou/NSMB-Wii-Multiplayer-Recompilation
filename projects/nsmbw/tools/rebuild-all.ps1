@@ -5,8 +5,10 @@
 # -Newer <extracted Newer folder>: Newer Super Mario Bros. Wii instead (BUILDING.md section 7):
 # newer_prelink.py writes ..\game-newer, recomp-newer.yml is translated, native-build-newer is built.
 # Both share generated\, so switching between them retranslates.
+# -TranslatedJobs and -X86Level go to configure-native.ps1 when the build folder is configured here.
 [CmdletBinding()]
-param([int]$Threads = 10, [int]$Jobs = 10, [string]$Newer)
+param([int]$Threads = 10, [int]$Jobs = 10, [string]$Newer, [int]$TranslatedJobs = 6,
+    [ValidateSet('v3', 'v2')][string]$X86Level = 'v3')
 
 $ErrorActionPreference = 'Stop'
 if ($Newer) { $Newer = (Resolve-Path -LiteralPath $Newer).Path }  # before Push-Location below
@@ -72,7 +74,7 @@ try {
 }
 # The first build configures: CMake needs generated\build_shards, which only the steps above write.
 if (-not (Test-Path -LiteralPath (Join-Path $build 'build.ninja'))) {
-    & (Join-Path $PSScriptRoot 'configure-native.ps1') -Newer:([bool]$Newer)
+    & (Join-Path $PSScriptRoot 'configure-native.ps1') -Newer:([bool]$Newer) -TranslatedJobs $TranslatedJobs -X86Level $X86Level
     if ($LASTEXITCODE -ne 0) {
         Get-Content (Join-Path $logs 'configure.log') -Tail 20
         throw "configure failed ($LASTEXITCODE); see $(Join-Path $logs 'configure.log')"

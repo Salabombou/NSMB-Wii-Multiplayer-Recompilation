@@ -3,12 +3,14 @@
 # the portable llvm-mingw/CMake/Ninja toolchain, and a scrubbed PATH so no other compiler leaks in.
 # -Newer: Newer Super Mario Bros. Wii (BUILDING.md section 7) in native-build-newer, accepting its
 # disc (NSMBW_GAME_ID=SMNE03).
+# -X86Level v2: the "compat" build for x86-64 CPUs without AVX2/FMA (MKW_X86_LEVEL, PublicProducts.cmake).
 [CmdletBinding()]
 param(
     [int]$TranslatedJobs = 6,
     [string]$BuildDirectory,
     [string]$LogPath,
-    [switch]$Newer
+    [switch]$Newer,
+    [ValidateSet('v3', 'v2')][string]$X86Level = 'v3'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,7 +35,8 @@ $configure = Get-MkwNativeConfigureArguments `
     -CxxCompiler (Join-Path $bin 'x86_64-w64-mingw32-clang++.exe') `
     -ResourceCompiler (Join-Path $bin 'x86_64-w64-mingw32-windres.exe') `
     -DependenciesDirectory (Join-Path $workspace 'Dependencies') `
-    -AdditionalArguments @("-DMKW_TRANSLATED_COMPILE_JOBS=$TranslatedJobs", "-DNSMBW_GAME_ID=$gameId")
+    -AdditionalArguments @("-DMKW_TRANSLATED_COMPILE_JOBS=$TranslatedJobs", "-DNSMBW_GAME_ID=$gameId",
+        "-DMKW_X86_LEVEL=$X86Level")
 
 # Windows PowerShell 5.1 turns a native program's stderr lines into error records; CMake prints
 # ordinary status there, so run it with 'Continue' and keep the log as plain text.
